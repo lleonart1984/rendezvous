@@ -13,6 +13,20 @@ from enum import Enum
 import numpy as np
 
 
+__TRACE__ = False
+
+from vulkan._vulkan import _wrap_vkCreateRayTracingPipelinesNV
+
+
+def trace_destroying(function):
+    def wrapper(self, *args):
+        if __TRACE__:
+            print(f"[INFO] Destroying {type(self)}...", end='')
+        function(self, *args)
+        if __TRACE__:
+            print("done.")
+    return wrapper
+
 class ResourceState:
     def __init__(self, vk_access, vk_stage, vk_layout, queue_index):
         self.vk_access = vk_access
@@ -182,6 +196,7 @@ class ResourceData:
 
         self.__permanent_map = None  # Permanent mapped buffer
 
+    @trace_destroying
     def __del__(self):
         if self.vk_resource_memory:
             if self.is_buffer:
@@ -189,6 +204,8 @@ class ResourceData:
             else:
                 vkDestroyImage(self.device.vk_device, self.vk_resource, None)
             vkFreeMemory(self.device.vk_device, self.vk_resource_memory, None)
+        self.__staging = None
+        self.device = None
 
     def _resolve_staging(self):
         if self.vk_properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT:
@@ -388,6 +405,7 @@ class ResourceWrapper:
         self.current_slice = resource_slice
         self.is_readonly = False
 
+    @trace_destroying
     def __del__(self):
         # Destroy view if any
         if self.vk_view:
@@ -395,6 +413,7 @@ class ResourceWrapper:
                 vkDestroyBufferView(self.resource_data.device.vk_device, self.vk_view, None)
             else:
                 vkDestroyImageView(self.resource_data.device.vk_device, self.vk_view, None)
+        self.resource_data = None
 
     def add_barrier(self, vk_cmdList, state: ResourceState):
         srcAccessMask, srcStageMask, oldLayout, srcQueue = self.resource_data.current_state
@@ -624,6 +643,9 @@ class PipelineBindingWrapper:
         self.active_level = 0
         self.active_descriptor_set = self.descriptor_sets_description[0]  # by default activate global set
         self.shaders = {}
+        self.rt_shaders = []  # shader stages
+        self.rt_groups = []  # groups for hits
+        self.max_recursion_depth = 1
         self.initialized = False
         self.descriptor_set_layouts = []
         self.descriptor_sets = None
@@ -638,8 +660,8 @@ class PipelineBindingWrapper:
         else:
             self.point = VK_PIPELINE_BIND_POINT_RAY_TRACING_NV
 
+    @trace_destroying
     def __del__(self):
-        print("[INFO] Destroying pipeline object...")
         # Destroy desciptor sets
         vkDestroyDescriptorPool(self.device.vk_device, self.descriptor_pool, None)
         # Destroy layouts
@@ -650,7 +672,6 @@ class PipelineBindingWrapper:
         # Destroy pipeline object
         if self.pipeline_object:
             vkDestroyPipeline(self.device.vk_device, self.pipeline_object, None)
-        self.device = None
         self.descriptor_sets_description = [[], [], [], []]
         self.active_level = 0
         self.active_descriptor_set = None
@@ -661,6 +682,7 @@ class PipelineBindingWrapper:
         self.pipeline_object = None
         self.pipeline_layout = None
         self.current_cmdList = None
+        self.device = None
 
     def descriptor_set(self, level):
         assert not self.initialized, "Error, can not continue pipeline setup after initialized"
@@ -675,7 +697,22 @@ class PipelineBindingWrapper:
 
     def load_shader(self, w_shader):
         assert not self.initialized, "Error, can not continue pipeline setup after initialized"
-        self.shaders[w_shader.vk_stage_info.stage] = w_shader
+        if self.pipeline_type == VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_NV:
+            self.rt_shaders.append(w_shader)
+            return len(self.rt_shaders)-1
+        else:
+            self.shaders[w_shader.vk_stage_info.stage] = w_shader
+
+    def create_hitgroup(self, closest_hit_handle:int=None, any_hit_handle:int=None, intersection_handle:int=None):
+        self.rt_groups.append(VkRayTracingShaderGroupCreateInfoNV(
+            closestHitShader=closest_hit_handle,
+            anyHitShader=any_hit_handle,
+            intersectionShader=intersection_handle
+        ))
+        return len(self.rt_groups)-1
+
+    def set_max_recursion(self, depth):
+        self.max_recursion_depth = depth
 
     def _build_objects(self):
         assert not self.initialized, "Error, can not continue pipeline setup after initialized"
@@ -686,7 +723,8 @@ class PipelineBindingWrapper:
             VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: 1,
             VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: 1,
             VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: 1,
-            VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER: 1
+            VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER: 1,
+            VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_NV: 1,
         }
         for level in range(4):
             for slot, vk_stage, vk_descriptor_type, count, resolver in self.descriptor_sets_description[level]:
@@ -695,7 +733,7 @@ class PipelineBindingWrapper:
                 counting_by_type[vk_descriptor_type] += count * self.device.get_number_of_frames()
         self.descriptor_pool = vkCreateDescriptorPool(self.device.vk_device, VkDescriptorPoolCreateInfo(
             maxSets=4 * self.device.get_number_of_frames(),
-            poolSizeCount=5,
+            poolSizeCount=6,
             pPoolSizes=[VkDescriptorPoolSize(t, c) for t, c in counting_by_type.items()]
         ), pAllocator=None)
 
@@ -730,6 +768,17 @@ class PipelineBindingWrapper:
                                                                 )], None)[0]
         elif self.pipeline_type == VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO:
             pass
+        elif self.pipeline_type == VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_NV:
+            self.pipeline_object = self.device.vkCreateRayTracingPipelinesNV(self.device.vk_device, VK_NULL_HANDLE, 1,
+                                                            [
+                                                                VkRayTracingPipelineCreateInfoNV(
+                                                                    layout=self.pipeline_layout,
+                                                                    stageCount=len(self.rt_shaders),
+                                                                    pStages=[s.vk_stage_info for s in self.rt_shaders],
+                                                                    groupCount=len(self.rt_groups),
+                                                                    pGroups=self.rt_groups,
+                                                                    maxRecursionDepth=self.max_recursion_depth
+                                                                )], None)[0]
         self.initialized = True
 
     def _set_at_cmdList(self, vk_cmdList, queue_index):
@@ -747,7 +796,12 @@ class PipelineBindingWrapper:
     __SHADER_STAGE_2_PIPELINE_STAGE = {
         VK_SHADER_STAGE_VERTEX_BIT: VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
         VK_SHADER_STAGE_FRAGMENT_BIT: VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-        VK_SHADER_STAGE_COMPUTE_BIT: VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+        VK_SHADER_STAGE_COMPUTE_BIT: VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_SHADER_STAGE_ANY_HIT_BIT_NV: VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_NV,
+        VK_SHADER_STAGE_MISS_BIT_NV: VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_NV,
+        VK_SHADER_STAGE_CLOSEST_HIT_BIT_NV: VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_NV,
+        VK_SHADER_STAGE_INTERSECTION_BIT_NV: VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_NV,
+        VK_SHADER_STAGE_RAYGEN_BIT_NV: VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_NV,
     }
 
     def _solve_resolver_as_image(self, t, vk_descriptor_type, vk_shader_stage):
@@ -834,10 +888,15 @@ class CommandBufferWrapper:
 
     def __init__(self, vk_cmdList, pool):
         self.vk_cmdList = vk_cmdList
-        self.pool = pool
+        self.pool : CommandPoolWrapper = pool
         self.__is_frozen = False
         self.state = CommandListState.INITIAL
         self.current_pipeline = None
+
+    @trace_destroying
+    def __del__(self):
+        self.current_pipeline = None
+        self.pool = None
 
     def begin(self):
         assert self.state == CommandListState.INITIAL, "Error, to begin a cmdList should be in initial state"
@@ -848,6 +907,7 @@ class CommandBufferWrapper:
         assert self.state == CommandListState.RECORDING, "Error, to end a cmdList should be in recording"
         vkEndCommandBuffer(self.vk_cmdList)
         self.state = CommandListState.EXECUTABLE
+        # self.current_pipeline = None
 
     def reset(self):
         assert not self.__is_frozen, "Can not reset a frozen cmdList"
@@ -926,8 +986,12 @@ class GPUTaskWrapper:
             return
         self.pool.wait(self)
 
+    @trace_destroying
     def __del__(self):
         self.wait()
+        self.fence = None
+        self.cmdLists = None
+        self.pool = None
 
 
 class ShaderStageWrapper:
@@ -961,8 +1025,9 @@ class ShaderStageWrapper:
 
 
 class CommandPoolWrapper:
-    def __init__(self, vk_device, vk_queue, vk_pool, queue_index):
-        self.vk_device = vk_device
+    def __init__(self, device, vk_queue, vk_pool, queue_index):
+        self.device = device
+        self.vk_device = device.vk_device
         self.vk_pool = vk_pool
         self.vk_queue = vk_queue
         self.attached = []  # attached CommandBufferWrapper can be automatically flushed
@@ -970,10 +1035,17 @@ class CommandPoolWrapper:
         self.reusable_fences = []
         self.queue_index = queue_index
 
+    @trace_destroying
     def __del__(self):
+        vkFreeCommandBuffers(self.vk_device, self.vk_pool, len(self.reusable), self.reusable)
         if self.vk_pool:
             vkDestroyCommandPool(self.vk_device, self.vk_pool, None)
         [vkDestroyFence(self.vk_device, fence, None) for fence in self.reusable_fences]
+        self.attached = []  # attached CommandBufferWrapper can be automatically flushed
+        self.reusable = []  # commandlists have been submitted and finished that can be reused
+        self.reusable_fences = []
+        self.device = None
+
 
     def get_fence(self):
         if len(self.reusable_fences) > 0:
@@ -1112,8 +1184,8 @@ class DeviceWrapper:
         self.__createQueues()
         self.__createSwapchain()
 
+    @trace_destroying
     def __del__(self):
-        print("[INFO] Destroying vulkan device wrapper...")
         vkDeviceWaitIdle(self.vk_device)
 
         self.__queues = []  # list of queue objects for each queue family (only one queue used for family)
@@ -1136,7 +1208,6 @@ class DeviceWrapper:
             vkDestroyShaderModule(self.vk_device, v, None)
         self.loaded_modules = {}
 
-
         if self.__swapchain:
             self.vkDestroySwapchainKHR(self.vk_device, self.__swapchain, None)
         if self.vk_device:
@@ -1148,7 +1219,6 @@ class DeviceWrapper:
         if self.__instance:
             vkDestroyInstance(self.__instance, None)
         print('[INFO] Destroyed vulkan instance')
-
 
     def __load_vk_calls(self):
         self.vkCreateSwapchainKHR = vkGetInstanceProcAddr(self.__instance, 'vkCreateSwapchainKHR')
@@ -1162,6 +1232,7 @@ class DeviceWrapper:
         self.vkDestroyDebugReportCallbackEXT = vkGetInstanceProcAddr(self.__instance, "vkDestroyDebugReportCallbackEXT")
         self.vkDestroySwapchainKHR = vkGetInstanceProcAddr(self.__instance, "vkDestroySwapchainKHR")
         self.vkDestroySurfaceKHR = vkGetInstanceProcAddr(self.__instance, "vkDestroySurfaceKHR")
+        self.vkCreateRayTracingPipelinesNV = vkGetInstanceProcAddr(self.__instance, "vkCreateRayTracingPipelinesNV")
 
     def __createSwapchain(self):
         self.__render_target_extent = VkExtent2D(self.width, self.height)
@@ -1288,7 +1359,7 @@ class DeviceWrapper:
                     flags=VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
                 ),
                 pAllocator=None)
-            self.__managers.append(CommandPoolWrapper(self.vk_device, self.__queues[i], pool, i))
+            self.__managers.append(CommandPoolWrapper(self, self.__queues[i], pool, i))
 
         for i, qf in enumerate(queue_families):
             support_present = self.mode == 1 or self.vkGetPhysicalDeviceSurfaceSupportKHR(

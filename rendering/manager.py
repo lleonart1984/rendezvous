@@ -20,7 +20,9 @@ def compile_shader_sources(directory='.'):
                 filename.endswith(".comp"):
             binary_file = filename + ".spv"
             if needs_to_update(filename, binary_file):
-                p = subprocess.Popen(f'Compile.bat {filename} {binary_file}')
+                p = subprocess.Popen(
+                    os.path.expandvars('%VULKAN_SDK%/Bin32/glslc.exe ') + f'{filename} -o {binary_file}'
+                )
                 p.wait()
                 print(f'[INFO] Compiled... {filename}')
 
@@ -121,6 +123,11 @@ class ShaderStage(IntEnum):
     VERTEX = VK_SHADER_STAGE_VERTEX_BIT
     FRAGMENT = VK_SHADER_STAGE_FRAGMENT_BIT
     COMPUTE = VK_SHADER_STAGE_COMPUTE_BIT
+    RT_GENERATION = VK_SHADER_STAGE_RAYGEN_BIT_NV
+    RT_CLOSEST_HIT = VK_SHADER_STAGE_CLOSEST_HIT_BIT_NV
+    RT_MISS = VK_SHADER_STAGE_MISS_BIT_NV
+    RT_ANY_HIT = VK_SHADER_STAGE_ANY_HIT_BIT_NV
+    RT_INTERSECTION_HIT = VK_SHADER_STAGE_INTERSECTION_BIT_NV
 
 
 class UpdateLevel(IntEnum):
@@ -164,6 +171,13 @@ class BorderColor(IntEnum):
     OPAQUE_BLACK_INT = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
     OPAQUE_WHITE_FLOAT = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE,
     OPAQUE_WHITE_INT = VK_BORDER_COLOR_INT_OPAQUE_WHITE
+
+
+class ADS_Status(IntEnum):
+    NOT_BUILT = 0
+    UP_TO_DATE = 1
+    NEEDS_DATA_UPDATE = 2
+    NEEDS_STRUCTURAL_UPDATE = 3
 
 
 # ---- HIGH LEVEL DEFINITIONS ----------
@@ -337,6 +351,55 @@ class Image(Resource):
         return self.w_resource.as_numpy()
 
 
+class ADSBase:
+    def __init__(self, device):
+        self.device = device
+        self.descriptions = []
+        self.internal_resource = None
+        self.status = ADS_Status.NOT_BUILT
+        self.baked_descriptions = []
+
+    def build(self):
+        if self.status == ADS_Status.UP_TO_DATE:
+            return
+        if self.status == ADS_Status.NEEDS_DATA_UPDATE:
+            # TODO: Only update buffer with new descriptions
+            return
+        if self.status == ADS_Status.NEEDS_STRUCTURAL_UPDATE:
+            return
+        return
+
+    def _create_buffer(self):
+        pass
+
+    def _update_buffer(self):
+        pass
+
+
+class GeometryADS(ADSBase):
+    def __init__(self, device):
+        super().__init__(device)
+
+    def append_triangles(self, buffer: Buffer):
+        pass
+
+    def build(self):
+        pass
+
+
+class SceneADS(ADSBase):
+    def __init__(self, device):
+        super().__init__(device)
+
+    def append_geometry(self, geometry: GeometryADS):
+        assert self.status == ADS_Status.NOT_BUILT, "Can not append geometries after built"
+        geometry.build()
+        self.geometry_descriptions.append(geometry.internal_resource)
+
+    def build(self):
+        pass
+
+
 class Pipeline:
     def __init__(self, w_pipeline: vkw.PipelineBindingWrapper):
         self.w_pipeline = w_pipeline
@@ -393,7 +456,7 @@ class Pipeline:
         self._bind_resource(slot, stage, count, resolver, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
 
     def load_shader(self, stage: ShaderStage, path, main_function = 'main'):
-        self.w_pipeline.load_shader(vkw.ShaderStageWrapper.from_file(
+        return self.w_pipeline.load_shader(vkw.ShaderStageWrapper.from_file(
             device=self.w_pipeline.device,
             vk_stage=stage,
             main_function=main_function,
@@ -582,6 +645,15 @@ class DeviceManager:
             usage=BufferUsage.TRANSFER_SRC | BufferUsage.TRANSFER_DST,
             memory=MemoryProperty.CPU
         )
+
+    def create_scene_ads(self):
+        return SceneADS(self)
+
+    def create_triangle_ads(self):
+        return GeometryADS(self)
+
+    def create_procedural_ads(self):
+        return GeometryADS(self)
 
     def create_render_target(self, image_format: Format, width: int, height: int):
         return self.create_image(ImageType.TEXTURE_2D, False, image_format,
