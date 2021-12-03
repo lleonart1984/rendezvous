@@ -15,8 +15,6 @@ import numpy as np
 
 __TRACE__ = False
 
-from vulkan._vulkan import _wrap_vkCreateRayTracingPipelinesNV
-
 
 def trace_destroying(function):
     def wrapper(self, *args):
@@ -410,9 +408,9 @@ class ResourceWrapper:
         # Destroy view if any
         if self.vk_view:
             if self.resource_data.is_buffer:
-                vkDestroyBufferView(self.resource_data.device.vk_device, self.vk_view, None)
+                vkDestroyBufferView(self.resource_data.w_device.vk_device, self.vk_view, None)
             else:
-                vkDestroyImageView(self.resource_data.device.vk_device, self.vk_view, None)
+                vkDestroyImageView(self.resource_data.w_device.vk_device, self.vk_view, None)
         self.resource_data = None
 
     def add_barrier(self, vk_cmdList, state: ResourceState):
@@ -482,6 +480,8 @@ class ResourceWrapper:
         return ResourceWrapper(self.resource_data, new_slice)
 
     def write(self, bytes):
+        if isinstance(bytes, list):
+            bytes = np.array(bytes)
         if isinstance(bytes, np.ndarray):  # get buffer from numpy array
             bytes = bytes.data.cast('b')
         if self.resource_data.is_buffer:
@@ -635,9 +635,23 @@ class SamplerWrapper:
         self.vk_sampler = vk_sampler
 
 
+class ShaderHandlerWrapper:
+    def __init__(self, w_pipeline, group_index):
+        self.w_pipeline = w_pipeline
+        self.group_index = group_index
+        self.cached_handle = None
+        self.handle_stride = self.w_pipeline.w_device.raytracing_properties.shaderGroupHandleSize
+
+    def copy_handle(self, buffer, pos):
+        if self.cached_handle is None:
+            self.cached_handle = bytearray(self.handle_stride)
+            self.w_pipeline.copy_handle_to(self.group_index, self.cached_handle)
+        buffer[pos*self.handle_stride:(pos+1)*self.handle_stride] = self.cached_handle
+
+
 class PipelineBindingWrapper:
-    def __init__(self, device, pipeline_type):
-        self.device = device
+    def __init__(self, w_device, pipeline_type):
+        self.w_device = w_device
         self.pipeline_type = pipeline_type
         self.descriptor_sets_description = [[], [], [], []]
         self.active_level = 0
@@ -663,15 +677,15 @@ class PipelineBindingWrapper:
     @trace_destroying
     def __del__(self):
         # Destroy desciptor sets
-        vkDestroyDescriptorPool(self.device.vk_device, self.descriptor_pool, None)
+        vkDestroyDescriptorPool(self.w_device.vk_device, self.descriptor_pool, None)
         # Destroy layouts
-        [vkDestroyDescriptorSetLayout(self.device.vk_device, dl, None) for dl in self.descriptor_set_layouts]
+        [vkDestroyDescriptorSetLayout(self.w_device.vk_device, dl, None) for dl in self.descriptor_set_layouts]
         # Destroy pipeline layout
         if self.pipeline_layout:
-            vkDestroyPipelineLayout(self.device.vk_device, self.pipeline_layout, None)
+            vkDestroyPipelineLayout(self.w_device.vk_device, self.pipeline_layout, None)
         # Destroy pipeline object
         if self.pipeline_object:
-            vkDestroyPipeline(self.device.vk_device, self.pipeline_object, None)
+            vkDestroyPipeline(self.w_device.vk_device, self.pipeline_object, None)
         self.descriptor_sets_description = [[], [], [], []]
         self.active_level = 0
         self.active_descriptor_set = None
@@ -682,7 +696,7 @@ class PipelineBindingWrapper:
         self.pipeline_object = None
         self.pipeline_layout = None
         self.current_cmdList = None
-        self.device = None
+        self.w_device = None
 
     def descriptor_set(self, level):
         assert not self.initialized, "Error, can not continue pipeline setup after initialized"
@@ -695,21 +709,41 @@ class PipelineBindingWrapper:
             (slot, vk_stage, vk_descriptor_type, count, resolver)
         )
 
-    def load_shader(self, w_shader):
+    def load_shader(self, w_shader) -> int:
         assert not self.initialized, "Error, can not continue pipeline setup after initialized"
         if self.pipeline_type == VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_NV:
             self.rt_shaders.append(w_shader)
             return len(self.rt_shaders)-1
         else:
             self.shaders[w_shader.vk_stage_info.stage] = w_shader
+            return None
 
-    def create_hitgroup(self, closest_hit_handle:int=None, any_hit_handle:int=None, intersection_handle:int=None):
+    def create_hit_group(self,
+                         closest_hit_index: int = None,
+                         any_hit_index: int = None,
+                         intersection_index: int = None):
+        type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_NV \
+            if intersection_index is None \
+            else VK_RAY_TRACING_SHADER_GROUP_TYPE_PROCEDURAL_HIT_GROUP_NV
         self.rt_groups.append(VkRayTracingShaderGroupCreateInfoNV(
-            closestHitShader=closest_hit_handle,
-            anyHitShader=any_hit_handle,
-            intersectionShader=intersection_handle
+            type=type,
+            generalShader=VK_SHADER_UNUSED_NV,
+            closestHitShader=VK_SHADER_UNUSED_NV if closest_hit_index is None else closest_hit_index,
+            anyHitShader=VK_SHADER_UNUSED_NV if any_hit_index is None else any_hit_index,
+            intersectionShader=VK_SHADER_UNUSED_NV if intersection_index is None else intersection_index
         ))
-        return len(self.rt_groups)-1
+        return ShaderHandlerWrapper(self, len(self.rt_groups)-1)
+
+    def create_general_group(self, shader_index: int):
+        type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_NV
+        self.rt_groups.append(VkRayTracingShaderGroupCreateInfoNV(
+            type=type,
+            generalShader=shader_index,
+            closestHitShader=VK_SHADER_UNUSED_NV,
+            anyHitShader=VK_SHADER_UNUSED_NV,
+            intersectionShader=VK_SHADER_UNUSED_NV
+        ))
+        return ShaderHandlerWrapper(self, len(self.rt_groups)-1)
 
     def set_max_recursion(self, depth):
         self.max_recursion_depth = depth
@@ -730,35 +764,35 @@ class PipelineBindingWrapper:
             for slot, vk_stage, vk_descriptor_type, count, resolver in self.descriptor_sets_description[level]:
                 lb = VkDescriptorSetLayoutBinding(slot, vk_descriptor_type, count, vk_stage)
                 descriptor_set_layout_bindings[level].append(lb)
-                counting_by_type[vk_descriptor_type] += count * self.device.get_number_of_frames()
-        self.descriptor_pool = vkCreateDescriptorPool(self.device.vk_device, VkDescriptorPoolCreateInfo(
-            maxSets=4 * self.device.get_number_of_frames(),
+                counting_by_type[vk_descriptor_type] += count * self.w_device.get_number_of_frames()
+        self.descriptor_pool = vkCreateDescriptorPool(self.w_device.vk_device, VkDescriptorPoolCreateInfo(
+            maxSets=4 * self.w_device.get_number_of_frames(),
             poolSizeCount=6,
             pPoolSizes=[VkDescriptorPoolSize(t, c) for t, c in counting_by_type.items()]
         ), pAllocator=None)
 
-        self.descriptor_set_layouts = [vkCreateDescriptorSetLayout(self.device.vk_device,
+        self.descriptor_set_layouts = [vkCreateDescriptorSetLayout(self.w_device.vk_device,
                                                                    VkDescriptorSetLayoutCreateInfo(
                                                                        bindingCount=len(lb),
                                                                        pBindings=lb
                                                                    ), None) for lb in descriptor_set_layout_bindings]
 
         # Builds the descriptor sets (one group for each frame)
-        descriptor_set_layouts_per_frame = self.descriptor_set_layouts * self.device.get_number_of_frames()
+        descriptor_set_layouts_per_frame = self.descriptor_set_layouts * self.w_device.get_number_of_frames()
         allocate_info = VkDescriptorSetAllocateInfo(
             descriptorPool=self.descriptor_pool,
             descriptorSetCount=len(descriptor_set_layouts_per_frame),
             pSetLayouts=descriptor_set_layouts_per_frame)
-        self.descriptor_sets = vkAllocateDescriptorSets(self.device.vk_device, allocate_info)
+        self.descriptor_sets = vkAllocateDescriptorSets(self.w_device.vk_device, allocate_info)
         # Builds pipeline object
         pipeline_layout_info = VkPipelineLayoutCreateInfo(
             setLayoutCount=4,
             pSetLayouts=self.descriptor_set_layouts
         )
-        self.pipeline_layout = vkCreatePipelineLayout(self.device.vk_device, pipeline_layout_info, None)
+        self.pipeline_layout = vkCreatePipelineLayout(self.w_device.vk_device, pipeline_layout_info, None)
         if self.pipeline_type == VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO:
             assert VK_SHADER_STAGE_COMPUTE_BIT in self.shaders, "Error, no compute shader bound!"
-            self.pipeline_object = vkCreateComputePipelines(self.device.vk_device, VK_NULL_HANDLE, 1,
+            self.pipeline_object = vkCreateComputePipelines(self.w_device.vk_device, VK_NULL_HANDLE, 1,
                                                             [
                                                                 VkComputePipelineCreateInfo(
                                                                     layout=self.pipeline_layout,
@@ -769,8 +803,8 @@ class PipelineBindingWrapper:
         elif self.pipeline_type == VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO:
             pass
         elif self.pipeline_type == VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_NV:
-            self.pipeline_object = self.device.vkCreateRayTracingPipelinesNV(self.device.vk_device, VK_NULL_HANDLE, 1,
-                                                            [
+            self.pipeline_object = self.w_device.vkCreateRayTracingPipelinesNV(self.w_device.vk_device, VK_NULL_HANDLE, 1,
+                                                                               [
                                                                 VkRayTracingPipelineCreateInfoNV(
                                                                     layout=self.pipeline_layout,
                                                                     stageCount=len(self.rt_shaders),
@@ -838,7 +872,7 @@ class PipelineBindingWrapper:
         )
 
     def _update_level(self, level):
-        frame = self.device.get_frame_index()
+        frame = self.w_device.get_frame_index()
         descriptorWrites = []
         for slot, vk_stage, vk_descriptor_type, count, resolver in self.descriptor_sets_description[level]:
             is_buffer = vk_descriptor_type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER or \
@@ -854,7 +888,7 @@ class PipelineBindingWrapper:
             )
             descriptorWrites.append(dw)
         vkUpdateDescriptorSets(
-            device=self.device.vk_device,
+            device=self.w_device.vk_device,
             descriptorWriteCount=len(descriptorWrites),
             pDescriptorWrites=descriptorWrites,
             descriptorCopyCount=0,
@@ -897,6 +931,8 @@ class CommandBufferWrapper:
     def __del__(self):
         self.current_pipeline = None
         self.pool = None
+
+    vkCmdBuildAccelerationStructureNV=None
 
     def begin(self):
         assert self.state == CommandListState.INITIAL, "Error, to begin a cmdList should be in initial state"
@@ -970,6 +1006,29 @@ class CommandBufferWrapper:
 
     def dispatch_groups(self, dimx, dimy, dimz):
         vkCmdDispatch(self.vk_cmdList, dimx, dimy, dimz)
+
+
+    def build_ads(self, w_ads: ResourceWrapper, ads_info, is_top: bool,
+                  w_instance_buffer: ResourceWrapper,
+                  w_scratch: ResourceWrapper):
+        if is_top:
+            CommandBufferWrapper.vkCmdBuildAccelerationStructureNV(
+                self.vk_cmdList,
+                ads_info,
+                w_instance_buffer.resource_data.vk_resource, w_instance_buffer.current_slice["offset"], False,
+                w_ads.resource_data.vk_resource,  # dst
+                VK_NULL_HANDLE,  # src
+                w_scratch.resource_data.vk_resource, 0  # scratch
+            )
+        else:
+            CommandBufferWrapper.vkCmdBuildAccelerationStructureNV(
+                self.vk_cmdList,
+                ads_info,
+                VK_NULL_HANDLE, 0, False,
+                w_ads.resource_data.vk_resource,        # dst
+                VK_NULL_HANDLE,                         # src
+                w_scratch.resource_data.vk_resource, 0  # scratch
+            )
 
 
 class GPUTaskWrapper:
@@ -1233,6 +1292,16 @@ class DeviceWrapper:
         self.vkDestroySwapchainKHR = vkGetInstanceProcAddr(self.__instance, "vkDestroySwapchainKHR")
         self.vkDestroySurfaceKHR = vkGetInstanceProcAddr(self.__instance, "vkDestroySurfaceKHR")
         self.vkCreateRayTracingPipelinesNV = vkGetInstanceProcAddr(self.__instance, "vkCreateRayTracingPipelinesNV")
+        self.vkGetAccelerationStructureHandleNV = \
+            vkGetInstanceProcAddr(self.__instance, "vkGetAccelerationStructureHandleNV")
+        self.vkCreateAccelerationStructureNV = vkGetInstanceProcAddr(self.__instance, "vkCreateAccelerationStructureNV")
+        self.vkGetAccelerationStructureMemoryRequirementsNV = vkGetInstanceProcAddr(
+            self.__instance, "vkGetAccelerationStructureMemoryRequirementsNV")
+        self.vkBindAccelerationStructureMemoryNV = vkGetInstanceProcAddr(
+            self.__instance, "vkBindAccelerationStructureMemoryNV")
+        CommandBufferWrapper.vkCmdBuildAccelerationStructureNV = \
+            vkGetInstanceProcAddr(self.__instance, "vkCmdBuildAccelerationStructureNV")
+        self.vkGetPhysicalDeviceProperties2=vkGetInstanceProcAddr(self.__instance, "vkGetPhysicalDeviceProperties2KHR")
 
     def __createSwapchain(self):
         self.__render_target_extent = VkExtent2D(self.width, self.height)
@@ -1331,7 +1400,14 @@ class DeviceWrapper:
                                                  flags=0)
                          for i, qf in enumerate(queue_families)]
         # Add here required extensions
-        extensions = [VK_KHR_SWAPCHAIN_EXTENSION_NAME]
+        extensions = [
+            VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+            VK_NV_RAY_TRACING_EXTENSION_NAME,
+            "VK_KHR_acceleration_structure",
+            "VK_KHR_ray_tracing_pipeline",
+            "VK_KHR_deferred_host_operations"
+        ]
+
         device_create = VkDeviceCreateInfo(
             sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
             pQueueCreateInfos=queues_create,
@@ -1488,8 +1564,8 @@ class DeviceWrapper:
             pApplicationName='Rendering with Python VK',
             applicationVersion=VK_MAKE_VERSION(1, 0, 0),
             pEngineName='pyvulkan',
-            engineVersion=VK_MAKE_VERSION(1, 0, 0),
-            apiVersion=VK_API_VERSION
+            engineVersion=VK_MAKE_VERSION(1, 2, 0),
+            apiVersion=VK_MAKE_VERSION(1, 2, 0)
         )
         if self.enable_validation_layers:
             instanceInfo = VkInstanceCreateInfo(
@@ -1517,6 +1593,13 @@ class DeviceWrapper:
         physical_devices_properties = {physical_device: vkGetPhysicalDeviceProperties(physical_device)
                                        for physical_device in physical_devices}
         self.__physical_device = physical_devices[0]
+
+        rt_prop = VkPhysicalDeviceRayTracingPropertiesNV()
+        prop = VkPhysicalDeviceProperties2(pNext=rt_prop)
+        self.vkGetPhysicalDeviceProperties2(self.__physical_device, prop)
+
+        self.raytracing_properties = rt_prop
+
         print("[INFO] Available devices: %s" % [p.deviceName
                                                 for p in physical_devices_properties.values()])
         print("[INFO] Selected device: %s\n" % physical_devices_properties[self.__physical_device].deviceName)
@@ -1634,6 +1717,85 @@ class DeviceWrapper:
 
     def create_buffer(self, size, usage, properties):
         return ResourceWrapper(resource_data=self.create_buffer_data(size, usage, properties))
+
+    def create_ads(self, geometry_type=0, descriptions=[], instances=0,
+                   memory_type: int = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT):
+        # Create object
+        vk_descriptions = []
+        if geometry_type == 0:  # Triangles
+            vk_descriptions = [
+                VkGeometryNV(
+                    geometryType=geometry_type,
+                    geometry=VkGeometryDataNV(
+                        aabbs=VkGeometryAABBNV(),
+                        triangles=VkGeometryTrianglesNV(
+                            vertexData=v_w_resource.resource_data.vk_resource,
+                            vertexOffset=v_w_resource.current_slice["offset"],
+                            vertexStride=v_stride,
+                            vertexCount=v_w_resource.current_slice["size"] // v_stride,
+                            indexType=VK_INDEX_TYPE_UINT32,
+                            indexData=VK_NULL_HANDLE if i_w_resource is None else i_w_resource.resource_data.vk_resource,
+                            indexCount=0 if i_w_resource is None else i_w_resource.current_slice['size'] // 4,
+                            indexOffset=0 if i_w_resource is None else i_w_resource.current_slice['offset'],
+                            transformData=VK_NULL_HANDLE if t_w_resource is None else t_w_resource.resource_data.vk_resource,
+                            transformOffset=0 if t_w_resource is None else t_w_resource.current_slice["offset"],
+                            vertexFormat=VK_FORMAT_R32G32B32_SFLOAT
+                        )
+                    )
+                ) for v_w_resource,
+                      v_stride,
+                      i_w_resource,
+                      t_w_resource
+                      in descriptions
+            ]
+        else:
+            vk_descriptions = []  #TODO: AABB support
+
+        acc_info = VkAccelerationStructureInfoNV(
+            type=VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_NV
+            if len(vk_descriptions) > 0
+            else VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_NV,
+            geometryCount=len(vk_descriptions),
+            pGeometries=vk_descriptions,
+            instanceCount=instances
+        )
+
+        info = VkAccelerationStructureCreateInfoNV(
+            compactedSize=0,
+            info=acc_info)
+        ads = self.vkCreateAccelerationStructureNV(self.vk_device, info, None)
+        # Create memory
+        mem_req_info = VkAccelerationStructureMemoryRequirementsInfoNV(
+            accelerationStructure=ads,
+            type=VK_ACCELERATION_STRUCTURE_MEMORY_REQUIREMENTS_TYPE_OBJECT_NV)
+        mem_req = self.vkGetAccelerationStructureMemoryRequirementsNV(self.vk_device, mem_req_info)
+        mem_alloc_info = VkMemoryAllocateInfo(
+            allocationSize=mem_req.memoryRequirements.size,
+            memoryTypeIndex=memory_type
+        )
+        buffer_memory = vkAllocateMemory(self.vk_device, mem_alloc_info, None)
+        # Bind object-memory
+        bind_info = VkBindAccelerationStructureMemoryInfoNV(
+            accelerationStructure=ads,
+            memory=buffer_memory,
+            memoryOffset=0
+        )
+        self.vkBindAccelerationStructureMemoryNV(self.vk_device, 1, [bind_info])
+        # Get Handle
+        handle = bytearray(8)
+        self.vkGetAccelerationStructureHandleNV(self.vk_device, ads, 8, ffi.from_buffer(handle))
+
+        mem_req_info = VkAccelerationStructureMemoryRequirementsInfoNV(
+            accelerationStructure=ads,
+            type=VK_ACCELERATION_STRUCTURE_MEMORY_REQUIREMENTS_TYPE_BUILD_SCRATCH_NV)
+        scratch_mem_req_info = self.vkGetAccelerationStructureMemoryRequirementsNV(
+            self.vk_device, mem_req_info)
+
+        resource = ResourceWrapper(ResourceData(
+            self, VkBufferCreateInfo(size=mem_req.memoryRequirements.size), memory_type, ads, buffer_memory, True,
+            self.__resolve_initial_state(True, VK_BUFFER_USAGE_RAY_TRACING_BIT_NV, memory_type)))
+
+        return resource, acc_info, handle, scratch_mem_req_info.memoryRequirements.size
 
     def create_image(self, image_type, image_format, flags, extent, mips, layers, linear,
                      initial_layout, usage, properties):

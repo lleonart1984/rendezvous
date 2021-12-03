@@ -1,6 +1,10 @@
 from vulkan import *
 from enum import IntFlag
 from enum import IntEnum
+
+from vulkan import VK_BUFFER_USAGE_RAY_TRACING_BIT_NV
+from vulkan._vulkan import _wrap_vkGetAccelerationStructureHandleNV
+
 from rendering import vkw
 import math
 import numpy as np
@@ -15,13 +19,14 @@ def compile_shader_sources(directory='.'):
         return not os.path.exists(binary) or os.path.getmtime(source) > os.path.getmtime(binary)
     for filename in os.listdir(directory):
         filename = directory+"/"+filename
-        if filename.endswith(".vert") or \
-                filename.endswith(".frag") or \
-                filename.endswith(".comp"):
-            binary_file = filename + ".spv"
+        filename_without_extension, extension = os.path.splitext(filename)
+        if extension == '.glsl':
+            stage = os.path.splitext(filename_without_extension)[1][1:]  # [1:] for removing the dot .
+            binary_file = filename_without_extension + ".spv"
             if needs_to_update(filename, binary_file):
                 p = subprocess.Popen(
-                    os.path.expandvars('%VULKAN_SDK%/Bin32/glslc.exe ') + f'{filename} -o {binary_file}'
+                    os.path.expandvars('%VULKAN_SDK%/Bin32/glslangValidator.exe -V --target-env vulkan1.2 ')
+                    + f'-S {stage} {filename} -o {binary_file}'
                 )
                 p.wait()
                 print(f'[INFO] Compiled... {filename}')
@@ -173,13 +178,6 @@ class BorderColor(IntEnum):
     OPAQUE_WHITE_INT = VK_BORDER_COLOR_INT_OPAQUE_WHITE
 
 
-class ADS_Status(IntEnum):
-    NOT_BUILT = 0
-    UP_TO_DATE = 1
-    NEEDS_DATA_UPDATE = 2
-    NEEDS_STRUCTURAL_UPDATE = 3
-
-
 # ---- HIGH LEVEL DEFINITIONS ----------
 
 
@@ -267,6 +265,13 @@ class Buffer(Resource):
     def read(self, data):
         self.w_resource.read(data)
 
+    def structured(self, **fields):
+        layout, size = Uniform.process_layout(fields)
+        return StructuredBuffer(self.w_resource, layout, size)
+
+    def as_indices(self):
+        return IndexBuffer(self.w_resource)
+
 
 class Uniform(Buffer):
 
@@ -305,6 +310,33 @@ class Uniform(Buffer):
             self.slice(offset, size).write(buffer)
             return
         raise AttributeError(f"Can not set attribute {item}")
+
+
+class StructuredBuffer(Buffer):
+    def __init__(self, w_buffer: vkw.ResourceWrapper, layout: Dict[str, Tuple[int, int, type]], stride: int):
+        self.layout = layout
+        super().__init__(w_buffer)
+        w_buffer.get_permanent_map()
+        self.stride = stride
+
+    def __getitem__(self, item):
+        return Uniform(self.w_resource.slice_buffer(item * self.stride, self.stride), self.layout)
+
+
+class IndexBuffer(Buffer):
+    def __init__(self, w_buffer: vkw.ResourceWrapper):
+        super().__init__(w_buffer)
+        w_buffer.get_permanent_map()
+
+    def __getitem__(self, item):
+        bytes = bytearray(4)
+        self.w_resource.slice_buffer(item * 4, 4).read(bytes)
+        return struct.unpack('i', bytes)[0]
+
+    def __setitem__(self, key, value):
+        assert isinstance(value, int) or isinstance(value, glm.uint32), "Only integers is supported"
+        bytes = struct.pack('i', value)
+        self.w_resource.slice_buffer(key * 4, 4).writes(bytes)
 
 
 class Image(Resource):
@@ -351,53 +383,155 @@ class Image(Resource):
         return self.w_resource.as_numpy()
 
 
-class ADSBase:
-    def __init__(self, device):
-        self.device = device
+class GeometryCollection:
+
+    def __init__(self, device: vkw.DeviceWrapper):
+        self.w_device = device
         self.descriptions = []
-        self.internal_resource = None
-        self.status = ADS_Status.NOT_BUILT
-        self.baked_descriptions = []
 
-    def build(self):
-        if self.status == ADS_Status.UP_TO_DATE:
-            return
-        if self.status == ADS_Status.NEEDS_DATA_UPDATE:
-            # TODO: Only update buffer with new descriptions
-            return
-        if self.status == ADS_Status.NEEDS_STRUCTURAL_UPDATE:
-            return
-        return
-
-    def _create_buffer(self):
-        pass
-
-    def _update_buffer(self):
+    def get_collection_type(self) -> int:
         pass
 
 
-class GeometryADS(ADSBase):
-    def __init__(self, device):
+class TriangleCollection(GeometryCollection):
+
+    def __init__(self, device: vkw.DeviceWrapper):
         super().__init__(device)
 
-    def append_triangles(self, buffer: Buffer):
+    def append(self, vertices: StructuredBuffer,
+                     indices: IndexBuffer = None,
+                     transform: StructuredBuffer = None):
+        assert transform is None or transform.stride == 4 * 12, "Transform buffer can not be cast to 3x4 float"
+        self.descriptions.append((vertices, indices, transform))
+        # resource_data = vertices.w_resource.resource_data
+        # slice = vertices.w_resource.current_slice
+        # index_data = None if indices is None else indices.w_resource.resource_data
+        # index_slice = None if indices is None else indices.w_resource.current_slice
+        # transform_data = None if transform is None else transform.w_resource.resource_data.vk_resource
+        # transform_offset = None if transform is None else transform.w_resource.current_slice["offset"]
+        # self.descriptions.append(
+        #     VkGeometryTrianglesNV(
+        #         vertexData=resource_data.vk_resource,
+        #         vertexOffset=slice["offset"],
+        #         vertexStride=vertices.stride,
+        #         vertexCount=slice["size"] // vertices.stride,
+        #         indexType=VK_INDEX_TYPE_UINT32,
+        #         indexData=None if index_data is None else index_data.vk_resource,
+        #         indexCount=None if index_data is None else index_slice['size'] / 4,
+        #         indexOffset=None if index_data is None else index_slice['offset'],
+        #         transformData=transform_data,
+        #         transformOffset=transform_offset,
+        #         vertexFormat=VK_FORMAT_R32G32B32_SFLOAT
+        #     )
+        # )
+
+    def get_collection_type(self) -> int:
+        return 0  # Triangles
+
+
+class Instance:
+    def __init__(self, instance_buffer, index, buffer):
+        self.instance_buffer = instance_buffer
+        self.index = index
+        self.buffer = buffer
+
+    def __get_int_value(self, offset, size):
+        bytes = b'\x00\x00\x00\x00'
+        bytes[4 - size:4] = self.buffer[offset:offset + size]
+        return struct.unpack('i', bytes)[0]
+
+    def __set_int_value(self, offset, size, value):
+        bytes = struct.pack('i', value)
+        self.buffer[offset:offset + size] = bytes[4 - size:4]
+
+    def _get_transform(self):
+        return BinaryFormatter.from_bytes(glm.mat3x4, self.buffer[0:48])
+
+    def _set_transform(self, value):
+        self.buffer[0:48] = BinaryFormatter.to_bytes(glm.mat3x4, value)
+
+    transform = property(fget=_get_transform, fset=_set_transform)
+
+    def _get_id(self):
+        return self.__get_int_value(48, 3)
+
+    def _set_id(self, value):
+        self.__set_int_value(48, 3, value)
+
+    id = property(fget=_get_id, fset=_set_id)
+
+    def _get_mask(self):
+        return self.__get_int_value(51, 1)
+
+    def _set_mask(self, value):
+        self.__set_int_value(51, 1, value)
+
+    mask = property(fget=_get_mask, fset=_set_mask)
+
+    def _get_offset(self):
+        return self.__get_int_value(52, 3)
+
+    def _set_offset(self, value):
+        self.__set_int_value(52, 3, value)
+
+    offset = property(fget=_get_offset, fset=_set_offset)
+
+    def _get_flags(self):
+        return self.__get_int_value(55, 1)
+
+    def _set_flags(self, value):
+        self.__set_int_value(55, 1, value)
+
+    flags = property(fget=_get_flags, fset=_set_flags)
+
+    def _get_geometry(self):
+        return self.instance_buffer.geometries[self.index]
+
+    def _set_geometry(self, geometry):
+        self.instance_buffer.geometries[self.index] = geometry
+        self.buffer[56:64] = geometry.handle
+
+    geometry = property(fget=_get_geometry, fset=_set_geometry)
+
+
+class InstanceBuffer(Resource):
+    def __init__(self, w_buffer: vkw.ResourceWrapper, instances: int):
+        super().__init__(w_buffer)
+        self.buffer = self.w_resource.get_permanent_map()
+        self.number_of_instances = instances
+        self.geometries = [None]*instances  # list to keep referenced geometry's wrappers alive
+
+    def __getitem__(self, item):
+        return Instance(self, item, self.buffer[item * 64:item * 64 + 64])
+
+
+class ADS(Resource):
+    def __init__(self, w_resource: vkw.ResourceWrapper, handle, scratch_size,
+                 info: VkAccelerationStructureInfoNV, instance_buffer: InstanceBuffer):
+        super().__init__(w_resource)
+        self.ads_info = info
+        self.instance_buffer = instance_buffer
+        self.is_top_level = info.type == 0
+        self.handle = handle
+        self.scratch_size = scratch_size
+
+
+class RTProgram:
+
+    def __init__(self, pipeline, w_shader_table: vkw.ResourceWrapper, miss_length, hit_group_length):
+        self.pipeline = pipeline
+        rt_prop = self.pipeline.w_pipeline.w_device.raytracing_properties
+        shader_handle_stride = rt_prop.shaderGroupHandleSize
+        self.raygen_table = w_shader_table.slice_buffer(0, shader_handle_stride)
+        self.miss_table = w_shader_table.slice_buffer(shader_handle_stride, miss_length*shader_handle_stride)
+        self.hit_group_table = w_shader_table.slice_buffer(
+            (miss_length+1)*shader_handle_stride,
+            hit_group_length*shader_handle_stride)
+
+    def set_generation(self, shader_index):
         pass
 
-    def build(self):
-        pass
 
-
-class SceneADS(ADSBase):
-    def __init__(self, device):
-        super().__init__(device)
-
-    def append_geometry(self, geometry: GeometryADS):
-        assert self.status == ADS_Status.NOT_BUILT, "Can not append geometries after built"
-        geometry.build()
-        self.geometry_descriptions.append(geometry.internal_resource)
-
-    def build(self):
-        pass
 
 
 class Pipeline:
@@ -455,22 +589,39 @@ class Pipeline:
     def bind_storage_image_array(self, slot: int, stage: ShaderStage, count: int, resolver):
         self._bind_resource(slot, stage, count, resolver, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
 
+    def bind_scene_ads(self, slot: int, stage: ShaderStage, resolver):
+        self._bind_resource(slot, stage, 1, lambda: [resolver()], VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_NV)
+
     def load_shader(self, stage: ShaderStage, path, main_function = 'main'):
         return self.w_pipeline.load_shader(vkw.ShaderStageWrapper.from_file(
-            device=self.w_pipeline.device,
+            device=self.w_pipeline.w_device,
             vk_stage=stage,
             main_function=main_function,
             path=path))
 
     def load_fragment_shader(self, path: str, main_function='main'):
-        self.load_shader(VK_SHADER_STAGE_FRAGMENT_BIT, path, main_function)
+        return self.load_shader(VK_SHADER_STAGE_FRAGMENT_BIT, path, main_function)
 
     def load_vertex_shader(self, path: str, main_function='main'):
-        self.load_shader(VK_SHADER_STAGE_VERTEX_BIT, path, main_function)
+        return self.load_shader(VK_SHADER_STAGE_VERTEX_BIT, path, main_function)
 
     def load_compute_shader(self, path: str, main_function='main'):
-        self.load_shader(VK_SHADER_STAGE_COMPUTE_BIT, path, main_function)
+        return self.load_shader(VK_SHADER_STAGE_COMPUTE_BIT, path, main_function)
 
+    def load_rt_generation_shader(self, path: str, main_function='main'):
+        return self.load_shader(VK_SHADER_STAGE_RAYGEN_BIT_NV, path, main_function)
+
+    def load_rt_closest_hit_shader(self, path: str, main_function='main'):
+        return self.load_shader(VK_SHADER_STAGE_CLOSEST_HIT_BIT_NV, path, main_function)
+
+    def load_rt_miss_shader(self, path: str, main_function='main'):
+        return self.load_shader(VK_SHADER_STAGE_MISS_BIT_NV, path, main_function)
+
+    def create_rt_hit_group(self, closest_hit: int = None, any_hit: int = None, intersection: int = None):
+        return self.w_pipeline.create_hit_group(closest_hit, any_hit, intersection)
+
+    def create_rt_program(self, max_miss_shader = 10, max_hit_groups = 1000):
+        pass
 
 class CommandManager:
 
@@ -562,6 +713,13 @@ class RaytracingManager(GraphicsManager):
     def get_queue_required(cls) -> int:
         return QueueType.RAYTRACING
 
+    def build_ads(self, ads: ADS, scratch_buffer: Buffer):
+        self.w_cmdList.build_ads(
+            ads.w_resource,
+            ads.ads_info,
+            ads.is_top_level,
+            None if ads.instance_buffer is None else ads.instance_buffer.w_resource,
+            scratch_buffer.w_resource)
 
 class DeviceManager:
 
@@ -577,9 +735,6 @@ class DeviceManager:
 
     def render_target(self):
         return Image(self.w_device.get_render_target(self.w_device.get_render_target_index()))
-
-    def __setup__(self):
-        pass
 
     def load_technique(self, technique):
         technique.__bind__(self.w_device)
@@ -599,6 +754,13 @@ class DeviceManager:
         resource = self.w_device.create_buffer(size, usage, memory)
         # mapped_buffer = resource.resource_data.map_buffer_slice(0, size)
         return Uniform(resource, layout)
+
+    def create_structured_buffer(self, count:int, usage: int = BufferUsage.UNIFORM,
+                       memory: MemoryProperty = MemoryProperty.CPU_ACCESSIBLE,
+                       **fields):
+        layout, size = Uniform.process_layout(fields)
+        resource = self.w_device.create_buffer(size * count, usage, memory)
+        return StructuredBuffer(resource, layout, size)
 
     def create_image(self, image_type: ImageType, is_cube: bool, image_format: Format,
                      width: int, height: int, depth: int,
@@ -643,17 +805,37 @@ class DeviceManager:
         return self.create_buffer(
             size=size,
             usage=BufferUsage.TRANSFER_SRC | BufferUsage.TRANSFER_DST,
-            memory=MemoryProperty.CPU
+            memory=MemoryProperty.CPU_ACCESSIBLE
         )
 
-    def create_scene_ads(self):
-        return SceneADS(self)
+    def create_triangle_collection(self):
+        return TriangleCollection(device=self.w_device)
 
-    def create_triangle_ads(self):
-        return GeometryADS(self)
+    def create_geometry_ads(self, collection: GeometryCollection):
+        ads, info, handle, scratch_size = self.w_device.create_ads(
+            geometry_type=collection.get_collection_type(),
+            descriptions=[
+                (v.w_resource, v.stride, None if i is None else i.w_resource, None if t is None else t.w_resource)
+                for v, i, t in collection.descriptions
+            ]
+        )
+        return ADS(ads, handle, scratch_size, info, None)
 
-    def create_procedural_ads(self):
-        return GeometryADS(self)
+    def create_scene_ads(self, instance_buffer: InstanceBuffer):
+        ads, info, handle, scratch_size = self.w_device.create_ads(
+            instances=instance_buffer.number_of_instances
+        )
+        return ADS(ads, handle, scratch_size, info, instance_buffer)
+
+    def create_instance_buffer(self, instances: int):
+        instance_buffer = self.w_device.create_buffer(instances*64,
+                                             BufferUsage.TRANSFER_DST | BufferUsage.TRANSFER_SRC,
+                                             MemoryProperty.CPU_ACCESSIBLE)
+        return InstanceBuffer(instance_buffer, instances)
+
+    def create_scratch_buffer(self, *ads_set):
+        size = max(a.scratch_size for a in ads_set)
+        return self.create_buffer(size, VK_BUFFER_USAGE_RAY_TRACING_BIT_NV, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
 
     def create_render_target(self, image_format: Format, width: int, height: int):
         return self.create_image(ImageType.TEXTURE_2D, False, image_format,
