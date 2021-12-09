@@ -2,9 +2,6 @@ from vulkan import *
 from enum import IntFlag
 from enum import IntEnum
 
-from vulkan import VK_BUFFER_USAGE_RAY_TRACING_BIT_NV
-from vulkan._vulkan import _wrap_vkGetAccelerationStructureHandleNV
-
 from rendering import vkw
 import math
 import numpy as np
@@ -25,7 +22,7 @@ def compile_shader_sources(directory='.'):
             binary_file = filename_without_extension + ".spv"
             if needs_to_update(filename, binary_file):
                 p = subprocess.Popen(
-                    os.path.expandvars('%VULKAN_SDK%/Bin32/glslangValidator.exe -V --target-env vulkan1.2 ')
+                    os.path.expandvars('%VULKAN_SDK%/Bin/glslangValidator.exe -V --target-env vulkan1.2 ').replace("\\","/")
                     + f'-S {stage} {filename} -o {binary_file}'
                 )
                 p.wait()
@@ -39,6 +36,7 @@ Event = vkw.Event
 Window = vkw.WindowWrapper
 GPUTask = vkw.GPUTaskWrapper
 Footprint = vkw.SubresourceFootprint
+ShaderHandler = vkw.ShaderHandlerWrapper
 
 
 # ------------- ENUMS ---------------
@@ -67,6 +65,8 @@ class BufferUsage(IntFlag):
     STORAGE = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
     TRANSFER_SRC = VK_BUFFER_USAGE_TRANSFER_SRC_BIT
     TRANSFER_DST = VK_BUFFER_USAGE_TRANSFER_DST_BIT
+    RAYTRACING_ADS = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR
+    RAYTRACING_ADS_READ = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
 
 
 class ImageUsage(IntFlag):
@@ -82,6 +82,7 @@ class Format(IntEnum):
     UINT_RGBA = VK_FORMAT_R8G8B8A8_UINT
     UINT_BGRA_STD = VK_FORMAT_B8G8R8A8_SRGB
     UINT_RGBA_STD = VK_FORMAT_R8G8B8A8_SRGB
+    UINT_BGRA_UNORM = VK_FORMAT_B8G8R8A8_UNORM
     FLOAT = VK_FORMAT_R32_SFLOAT
     INT = VK_FORMAT_R32_SINT
     UINT = VK_FORMAT_R32_UINT
@@ -128,11 +129,11 @@ class ShaderStage(IntEnum):
     VERTEX = VK_SHADER_STAGE_VERTEX_BIT
     FRAGMENT = VK_SHADER_STAGE_FRAGMENT_BIT
     COMPUTE = VK_SHADER_STAGE_COMPUTE_BIT
-    RT_GENERATION = VK_SHADER_STAGE_RAYGEN_BIT_NV
-    RT_CLOSEST_HIT = VK_SHADER_STAGE_CLOSEST_HIT_BIT_NV
-    RT_MISS = VK_SHADER_STAGE_MISS_BIT_NV
-    RT_ANY_HIT = VK_SHADER_STAGE_ANY_HIT_BIT_NV
-    RT_INTERSECTION_HIT = VK_SHADER_STAGE_INTERSECTION_BIT_NV
+    RT_GENERATION = VK_SHADER_STAGE_RAYGEN_BIT_KHR
+    RT_CLOSEST_HIT = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR
+    RT_MISS = VK_SHADER_STAGE_MISS_BIT_KHR
+    RT_ANY_HIT = VK_SHADER_STAGE_ANY_HIT_BIT_KHR
+    RT_INTERSECTION_HIT = VK_SHADER_STAGE_INTERSECTION_BIT_KHR
 
 
 class UpdateLevel(IntEnum):
@@ -237,7 +238,11 @@ class BinaryFormatter:
         assert type in BinaryFormatter.__TYPE_SIZES, f"Not supported type {type}, use int, float or glm types"
         if type == int:
             return struct.unpack('i', buffer)[0]
-        return type.from_bytes(bytes(buffer))
+        if type == float:
+            return struct.unpack('f', buffer)[0]
+        if isinstance(buffer, bytearray):
+            return type.from_bytes(bytes(buffer))
+        return type.from_bytes(ffi.buffer(buffer)[0:BinaryFormatter.size_of(type)])
 
 
 class Resource(object):
@@ -389,6 +394,10 @@ class GeometryCollection:
         self.w_device = device
         self.descriptions = []
 
+    def __del__(self):
+        self.w_device = None
+        self.descriptions = []
+
     def get_collection_type(self) -> int:
         pass
 
@@ -403,27 +412,6 @@ class TriangleCollection(GeometryCollection):
                      transform: StructuredBuffer = None):
         assert transform is None or transform.stride == 4 * 12, "Transform buffer can not be cast to 3x4 float"
         self.descriptions.append((vertices, indices, transform))
-        # resource_data = vertices.w_resource.resource_data
-        # slice = vertices.w_resource.current_slice
-        # index_data = None if indices is None else indices.w_resource.resource_data
-        # index_slice = None if indices is None else indices.w_resource.current_slice
-        # transform_data = None if transform is None else transform.w_resource.resource_data.vk_resource
-        # transform_offset = None if transform is None else transform.w_resource.current_slice["offset"]
-        # self.descriptions.append(
-        #     VkGeometryTrianglesNV(
-        #         vertexData=resource_data.vk_resource,
-        #         vertexOffset=slice["offset"],
-        #         vertexStride=vertices.stride,
-        #         vertexCount=slice["size"] // vertices.stride,
-        #         indexType=VK_INDEX_TYPE_UINT32,
-        #         indexData=None if index_data is None else index_data.vk_resource,
-        #         indexCount=None if index_data is None else index_slice['size'] / 4,
-        #         indexOffset=None if index_data is None else index_slice['offset'],
-        #         transformData=transform_data,
-        #         transformOffset=transform_offset,
-        #         vertexFormat=VK_FORMAT_R32G32B32_SFLOAT
-        #     )
-        # )
 
     def get_collection_type(self) -> int:
         return 0  # Triangles
@@ -436,13 +424,13 @@ class Instance:
         self.buffer = buffer
 
     def __get_int_value(self, offset, size):
-        bytes = b'\x00\x00\x00\x00'
-        bytes[4 - size:4] = self.buffer[offset:offset + size]
+        bytes = bytearray(4)
+        bytes[0:size] = ffi.buffer(self.buffer[offset:offset + size])
         return struct.unpack('i', bytes)[0]
 
     def __set_int_value(self, offset, size, value):
         bytes = struct.pack('i', value)
-        self.buffer[offset:offset + size] = bytes[4 - size:4]
+        self.buffer[offset:offset + size] = bytes[0:size]
 
     def _get_transform(self):
         return BinaryFormatter.from_bytes(glm.mat3x4, self.buffer[0:48])
@@ -451,6 +439,41 @@ class Instance:
         self.buffer[0:48] = BinaryFormatter.to_bytes(glm.mat3x4, value)
 
     transform = property(fget=_get_transform, fset=_set_transform)
+
+    # def _get_mask(self):
+    #     return self.__get_int_value(48, 1)
+    #
+    # def _set_mask(self, value):
+    #     self.__set_int_value(48, 1, value)
+    #
+    # mask = property(fget=_get_mask, fset=_set_mask)
+    #
+    #
+    # def _get_id(self):
+    #     return self.__get_int_value(49, 3)
+    #
+    # def _set_id(self, value):
+    #     self.__set_int_value(49, 3, value)
+    #
+    # id = property(fget=_get_id, fset=_set_id)
+    #
+    #
+    # def _get_flags(self):
+    #     return self.__get_int_value(52, 1)
+    #
+    # def _set_flags(self, value):
+    #     self.__set_int_value(52, 1, value)
+    #
+    # flags = property(fget=_get_flags, fset=_set_flags)
+    #
+    # def _get_offset(self):
+    #     return self.__get_int_value(53, 3)
+    #
+    # def _set_offset(self, value):
+    #     self.__set_int_value(53, 3, value)
+    #
+    # offset = property(fget=_get_offset, fset=_set_offset)
+
 
     def _get_id(self):
         return self.__get_int_value(48, 3)
@@ -489,7 +512,7 @@ class Instance:
 
     def _set_geometry(self, geometry):
         self.instance_buffer.geometries[self.index] = geometry
-        self.buffer[56:64] = geometry.handle
+        self.buffer[56:64] = struct.pack('Q', geometry.handle)
 
     geometry = property(fget=_get_geometry, fset=_set_geometry)
 
@@ -507,31 +530,53 @@ class InstanceBuffer(Resource):
 
 class ADS(Resource):
     def __init__(self, w_resource: vkw.ResourceWrapper, handle, scratch_size,
-                 info: VkAccelerationStructureInfoNV, instance_buffer: InstanceBuffer):
+                 info: VkAccelerationStructureCreateInfoKHR, ranges):
         super().__init__(w_resource)
+        self.ads = w_resource.resource_data.ads
         self.ads_info = info
-        self.instance_buffer = instance_buffer
-        self.is_top_level = info.type == 0
         self.handle = handle
         self.scratch_size = scratch_size
+        self.ranges = ranges
 
 
 class RTProgram:
 
-    def __init__(self, pipeline, w_shader_table: vkw.ResourceWrapper, miss_length, hit_group_length):
+    def __init__(self, pipeline,
+                 w_shader_table: vkw.ResourceWrapper,
+                 miss_offset,
+                 hit_offset):
         self.pipeline = pipeline
-        rt_prop = self.pipeline.w_pipeline.w_device.raytracing_properties
-        shader_handle_stride = rt_prop.shaderGroupHandleSize
-        self.raygen_table = w_shader_table.slice_buffer(0, shader_handle_stride)
-        self.miss_table = w_shader_table.slice_buffer(shader_handle_stride, miss_length*shader_handle_stride)
-        self.hit_group_table = w_shader_table.slice_buffer(
-            (miss_length+1)*shader_handle_stride,
-            hit_group_length*shader_handle_stride)
+        prop = self.pipeline.w_pipeline.w_device.raytracing_properties
+        self.shader_handle_stride = prop.shaderGroupHandleSize
+        self.table_buffer = w_shader_table.get_permanent_map()
+        self.w_table = w_shader_table
+        self.raygen_slice = w_shader_table.slice_buffer(0, self.shader_handle_stride)
+        self.miss_slice = w_shader_table.slice_buffer(miss_offset, hit_offset - miss_offset)
+        self.hitgroup_slice = w_shader_table.slice_buffer(hit_offset, w_shader_table.get_size() - hit_offset)
+        self.miss_offset = miss_offset
+        self.hit_offset = hit_offset
 
-    def set_generation(self, shader_index):
-        pass
 
+    def __del__(self):
+        self.pipeline = None
+        self.w_table = None
+        self.raygen_slice = None
+        self.miss_slice = None
+        self.hitgroup_slice = None
 
+    def set_generation(self, shader_group: ShaderHandler):
+        self.table_buffer[0:self.shader_handle_stride] = shader_group.get_handle()
+
+    def set_miss(self, miss_index: int, shader_group: ShaderHandler):
+        self.table_buffer[
+        self.miss_offset + self.shader_handle_stride*miss_index:
+        self.miss_offset + self.shader_handle_stride*(miss_index+1)] = \
+            shader_group.get_handle()
+
+    def set_hit_group(self, hit_group_index, shader_group: ShaderHandler):
+        self.table_buffer[
+        self.hit_offset + self.shader_handle_stride * hit_group_index:
+        self.hit_offset + self.shader_handle_stride * (hit_group_index+1)] = shader_group.get_handle()
 
 
 class Pipeline:
@@ -590,7 +635,7 @@ class Pipeline:
         self._bind_resource(slot, stage, count, resolver, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
 
     def bind_scene_ads(self, slot: int, stage: ShaderStage, resolver):
-        self._bind_resource(slot, stage, 1, lambda: [resolver()], VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_NV)
+        self._bind_resource(slot, stage, 1, lambda: [resolver()], VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR)
 
     def load_shader(self, stage: ShaderStage, path, main_function = 'main'):
         return self.w_pipeline.load_shader(vkw.ShaderStageWrapper.from_file(
@@ -609,19 +654,40 @@ class Pipeline:
         return self.load_shader(VK_SHADER_STAGE_COMPUTE_BIT, path, main_function)
 
     def load_rt_generation_shader(self, path: str, main_function='main'):
-        return self.load_shader(VK_SHADER_STAGE_RAYGEN_BIT_NV, path, main_function)
+        return self.load_shader(VK_SHADER_STAGE_RAYGEN_BIT_KHR, path, main_function)
 
     def load_rt_closest_hit_shader(self, path: str, main_function='main'):
-        return self.load_shader(VK_SHADER_STAGE_CLOSEST_HIT_BIT_NV, path, main_function)
+        return self.load_shader(VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, path, main_function)
 
     def load_rt_miss_shader(self, path: str, main_function='main'):
-        return self.load_shader(VK_SHADER_STAGE_MISS_BIT_NV, path, main_function)
+        return self.load_shader(VK_SHADER_STAGE_MISS_BIT_KHR, path, main_function)
 
     def create_rt_hit_group(self, closest_hit: int = None, any_hit: int = None, intersection: int = None):
         return self.w_pipeline.create_hit_group(closest_hit, any_hit, intersection)
 
+    def create_rt_gen_group(self, generation_shader_index: int):
+        return self.w_pipeline.create_general_group(generation_shader_index)
+
+    def create_rt_miss_group(self, miss_shader_index: int):
+        return self.w_pipeline.create_general_group(miss_shader_index)
+
+    def _get_aligned_size(self, size, align):
+        return (size + align - 1) & (~(align - 1))
+
     def create_rt_program(self, max_miss_shader = 10, max_hit_groups = 1000):
-        pass
+        shaderHandlerSize = self.w_pipeline.w_device.raytracing_properties.shaderGroupHandleSize
+        groupAlignment = self.w_pipeline.w_device.raytracing_properties.shaderGroupBaseAlignment
+
+        raygen_size = self._get_aligned_size(shaderHandlerSize, groupAlignment)
+        raymiss_size = self._get_aligned_size(shaderHandlerSize * max_miss_shader, groupAlignment)
+        rayhit_size = self._get_aligned_size(shaderHandlerSize * max_hit_groups, groupAlignment)
+
+        w_buffer = self.w_pipeline.w_device.create_buffer(
+            raygen_size + raymiss_size + rayhit_size,
+            usage=VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            properties=MemoryProperty.CPU_ACCESSIBLE | MemoryProperty.CPU_DIRECT)
+        return RTProgram(self, w_buffer, raygen_size, raygen_size + raymiss_size)
+
 
 class CommandManager:
 
@@ -659,6 +725,9 @@ class CopyManager(CommandManager):
     def cpu_to_gpu(self, resource):
         self.w_cmdList.to_gpu(resource.w_resource)
 
+    def copy_image(self, src_image: Image, dst_image: Image):
+        self.w_cmdList.copy_image(src_image.w_resource, dst_image.w_resource)
+
 
 class ComputeManager(CopyManager):
     def __init__(self, w_cmdList: vkw.CommandBufferWrapper):
@@ -695,6 +764,12 @@ class ComputeManager(CopyManager):
     def dispatch_threads_2D(self, dim_x: int, dim_y: int, group_size_x: int = 32, group_size_y: int = 32):
         self.dispatch_groups(math.ceil(dim_x/group_size_x), math.ceil(dim_y/group_size_y))
 
+    def dispatch_rays(self, program: RTProgram, dim_x: int, dim_y: int, dim_z: int = 1):
+        self.w_cmdList.dispatch_rays(
+            program.raygen_slice, program.miss_slice, program.hitgroup_slice,
+            dim_x, dim_y, dim_z
+        )
+
 
 class GraphicsManager(ComputeManager):
     def __init__(self, w_cmdList: vkw.CommandBufferWrapper):
@@ -717,9 +792,9 @@ class RaytracingManager(GraphicsManager):
         self.w_cmdList.build_ads(
             ads.w_resource,
             ads.ads_info,
-            ads.is_top_level,
-            None if ads.instance_buffer is None else ads.instance_buffer.w_resource,
+            ads.ranges,
             scratch_buffer.w_resource)
+
 
 class DeviceManager:
 
@@ -812,30 +887,35 @@ class DeviceManager:
         return TriangleCollection(device=self.w_device)
 
     def create_geometry_ads(self, collection: GeometryCollection):
-        ads, info, handle, scratch_size = self.w_device.create_ads(
+        ads, info, ranges, handle, scratch_size = self.w_device.create_ads(
             geometry_type=collection.get_collection_type(),
             descriptions=[
                 (v.w_resource, v.stride, None if i is None else i.w_resource, None if t is None else t.w_resource)
                 for v, i, t in collection.descriptions
             ]
         )
-        return ADS(ads, handle, scratch_size, info, None)
+        return ADS(ads, handle, scratch_size, info, ranges)
 
     def create_scene_ads(self, instance_buffer: InstanceBuffer):
-        ads, info, handle, scratch_size = self.w_device.create_ads(
-            instances=instance_buffer.number_of_instances
+        ads, info, ranges, handle, scratch_size = self.w_device.create_ads(
+            geometry_type=VK_GEOMETRY_TYPE_INSTANCES_KHR,
+            descriptions=[
+                instance_buffer.w_resource
+            ]
         )
-        return ADS(ads, handle, scratch_size, info, instance_buffer)
+        return ADS(ads, handle, scratch_size, info, ranges)
 
     def create_instance_buffer(self, instances: int):
         instance_buffer = self.w_device.create_buffer(instances*64,
-                                             BufferUsage.TRANSFER_DST | BufferUsage.TRANSFER_SRC,
-                                             MemoryProperty.CPU_ACCESSIBLE)
+                                             BufferUsage.RAYTRACING_ADS_READ | BufferUsage.TRANSFER_DST | BufferUsage.TRANSFER_SRC,
+                                             MemoryProperty.CPU_ACCESSIBLE | MemoryProperty.CPU_DIRECT)
         return InstanceBuffer(instance_buffer, instances)
 
     def create_scratch_buffer(self, *ads_set):
         size = max(a.scratch_size for a in ads_set)
-        return self.create_buffer(size, VK_BUFFER_USAGE_RAY_TRACING_BIT_NV, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+        return self.create_buffer(size, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR
+                                  | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
 
     def create_render_target(self, image_format: Format, width: int, height: int):
         return self.create_image(ImageType.TEXTURE_2D, False, image_format,
@@ -923,7 +1003,7 @@ class DeviceManager:
 
     def create_raytracing_pipeline(self):
         return Pipeline(self.w_device.create_pipeline(
-            vk_pipeline_type=VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_NV))
+            vk_pipeline_type=VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR))
 
     def _get_queue_manager(self, queue_bits: int):
         return self.w_device.create_cmdList(queue_bits)

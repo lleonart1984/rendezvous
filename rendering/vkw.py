@@ -15,7 +15,6 @@ import numpy as np
 
 __TRACE__ = False
 
-
 def trace_destroying(function):
     def wrapper(self, *args):
         if __TRACE__:
@@ -135,6 +134,8 @@ class ResourceData:
         self.vk_resource_memory = vk_resource_memory
         self.current_state = initial_state
         self.is_buffer = is_buffer
+        self.is_ads = False
+        self.ads = None
         if is_buffer:
             self.full_slice = {"offset": 0, "size": vk_description.size}
         else:
@@ -194,16 +195,25 @@ class ResourceData:
 
         self.__permanent_map = None  # Permanent mapped buffer
 
+    def bind_ads(self, ads):
+        self.is_ads = True
+        self.ads = ads
+
+    vkDestroyAccelerationStructure = None
+
     @trace_destroying
     def __del__(self):
-        if self.vk_resource_memory:
+        if self.vk_resource_memory and self.device:
             if self.is_buffer:
+                if self.is_ads:
+                    ResourceData.vkDestroyAccelerationStructure(self.device.vk_device, self.ads, None)
                 vkDestroyBuffer(self.device.vk_device, self.vk_resource, None)
             else:
                 vkDestroyImage(self.device.vk_device, self.vk_resource, None)
             vkFreeMemory(self.device.vk_device, self.vk_resource_memory, None)
         self.__staging = None
         self.device = None
+        self.vk_resource_memory = None
 
     def _resolve_staging(self):
         if self.vk_properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT:
@@ -408,9 +418,9 @@ class ResourceWrapper:
         # Destroy view if any
         if self.vk_view:
             if self.resource_data.is_buffer:
-                vkDestroyBufferView(self.resource_data.w_device.vk_device, self.vk_view, None)
+                vkDestroyBufferView(self.resource_data.device.vk_device, self.vk_view, None)
             else:
-                vkDestroyImageView(self.resource_data.w_device.vk_device, self.vk_view, None)
+                vkDestroyImageView(self.resource_data.device.vk_device, self.vk_view, None)
         self.resource_data = None
 
     def add_barrier(self, vk_cmdList, state: ResourceState):
@@ -421,17 +431,18 @@ class ResourceWrapper:
             dstQueue = VK_QUEUE_FAMILY_IGNORED
 
         if self.resource_data.is_buffer:
-            barrier = VkBufferMemoryBarrier(
-                buffer=self.resource_data.vk_resource,
-                srcAccessMask=srcAccessMask,
-                dstAccessMask=dstAccessMask,
-                srcQueueFamilyIndex=srcQueue,
-                dstQueueFamilyIndex=dstQueue,
-                offset=0,
-                size=VK_WHOLE_SIZE
-            )
-            vkCmdPipelineBarrier(vk_cmdList, srcStageMask, dstStageMask, 0,
-                                 0, None, 1, barrier, 0, None)
+            if not self.resource_data.is_ads:
+                barrier = VkBufferMemoryBarrier(
+                    buffer=self.resource_data.vk_resource,
+                    srcAccessMask=srcAccessMask,
+                    dstAccessMask=dstAccessMask,
+                    srcQueueFamilyIndex=srcQueue,
+                    dstQueueFamilyIndex=dstQueue,
+                    offset=0,
+                    size=UINT64_MAX
+                )
+                vkCmdPipelineBarrier(vk_cmdList, srcStageMask, dstStageMask, 0,
+                                     0, None, 1, barrier, 0, None)
         else:
             barrier = VkImageMemoryBarrier(
                 image=self.resource_data.vk_resource,
@@ -584,6 +595,15 @@ class ResourceWrapper:
             layerCount=slice["array_count"]
         )
 
+    @staticmethod
+    def get_subresource_layers(slice):
+        return VkImageSubresourceLayers(
+            aspectMask=VK_IMAGE_ASPECT_COLOR_BIT,
+            mipLevel=slice["mip_start"],
+            baseArrayLayer=slice["array_start"],
+            layerCount=slice["array_count"]
+        )
+
     def get_view(self):
         if self.vk_view is None:
             if self.resource_data.is_buffer:
@@ -607,6 +627,13 @@ class ResourceWrapper:
                     subresourceRange=self.get_subresources(self.current_slice)
                 ), None)
         return self.vk_view
+
+    def get_size(self):
+        """
+        Gets the size in bytes of this buffer
+        """
+        assert self.resource_data.is_buffer, "Can not access to the size of an image"
+        return self.current_slice["size"]
 
     def add_transfer_from_gpu(self, vk_cmdList):
         self.add_barrier(vk_cmdList, state=ResourceState(
@@ -636,17 +663,14 @@ class SamplerWrapper:
 
 
 class ShaderHandlerWrapper:
-    def __init__(self, w_pipeline, group_index):
-        self.w_pipeline = w_pipeline
-        self.group_index = group_index
-        self.cached_handle = None
-        self.handle_stride = self.w_pipeline.w_device.raytracing_properties.shaderGroupHandleSize
+    def __init__(self):
+        self.handle = None
 
-    def copy_handle(self, buffer, pos):
-        if self.cached_handle is None:
-            self.cached_handle = bytearray(self.handle_stride)
-            self.w_pipeline.copy_handle_to(self.group_index, self.cached_handle)
-        buffer[pos*self.handle_stride:(pos+1)*self.handle_stride] = self.cached_handle
+    def get_handle(self):
+        return self.handle
+
+    def _set_handle(self, handle):
+        self.handle = handle
 
 
 class PipelineBindingWrapper:
@@ -659,6 +683,7 @@ class PipelineBindingWrapper:
         self.shaders = {}
         self.rt_shaders = []  # shader stages
         self.rt_groups = []  # groups for hits
+        self.rt_group_handles = []  # handles computed for each group
         self.max_recursion_depth = 1
         self.initialized = False
         self.descriptor_set_layouts = []
@@ -672,7 +697,7 @@ class PipelineBindingWrapper:
         elif self.pipeline_type == VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO:
             self.point = VK_PIPELINE_BIND_POINT_GRAPHICS
         else:
-            self.point = VK_PIPELINE_BIND_POINT_RAY_TRACING_NV
+            self.point = VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR
 
     @trace_destroying
     def __del__(self):
@@ -711,7 +736,7 @@ class PipelineBindingWrapper:
 
     def load_shader(self, w_shader) -> int:
         assert not self.initialized, "Error, can not continue pipeline setup after initialized"
-        if self.pipeline_type == VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_NV:
+        if self.pipeline_type == VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR:
             self.rt_shaders.append(w_shader)
             return len(self.rt_shaders)-1
         else:
@@ -722,28 +747,32 @@ class PipelineBindingWrapper:
                          closest_hit_index: int = None,
                          any_hit_index: int = None,
                          intersection_index: int = None):
-        type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_NV \
+        type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR \
             if intersection_index is None \
-            else VK_RAY_TRACING_SHADER_GROUP_TYPE_PROCEDURAL_HIT_GROUP_NV
-        self.rt_groups.append(VkRayTracingShaderGroupCreateInfoNV(
+            else VK_RAY_TRACING_SHADER_GROUP_TYPE_PROCEDURAL_HIT_GROUP_KHR
+        self.rt_groups.append(VkRayTracingShaderGroupCreateInfoKHR(
             type=type,
-            generalShader=VK_SHADER_UNUSED_NV,
-            closestHitShader=VK_SHADER_UNUSED_NV if closest_hit_index is None else closest_hit_index,
-            anyHitShader=VK_SHADER_UNUSED_NV if any_hit_index is None else any_hit_index,
-            intersectionShader=VK_SHADER_UNUSED_NV if intersection_index is None else intersection_index
+            generalShader=VK_SHADER_UNUSED_KHR,
+            closestHitShader=VK_SHADER_UNUSED_KHR if closest_hit_index is None else closest_hit_index,
+            anyHitShader=VK_SHADER_UNUSED_KHR if any_hit_index is None else any_hit_index,
+            intersectionShader=VK_SHADER_UNUSED_KHR if intersection_index is None else intersection_index
         ))
-        return ShaderHandlerWrapper(self, len(self.rt_groups)-1)
+        s = ShaderHandlerWrapper()
+        self.rt_group_handles.append(s)
+        return s
 
     def create_general_group(self, shader_index: int):
-        type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_NV
-        self.rt_groups.append(VkRayTracingShaderGroupCreateInfoNV(
+        type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR
+        self.rt_groups.append(VkRayTracingShaderGroupCreateInfoKHR(
             type=type,
             generalShader=shader_index,
-            closestHitShader=VK_SHADER_UNUSED_NV,
-            anyHitShader=VK_SHADER_UNUSED_NV,
-            intersectionShader=VK_SHADER_UNUSED_NV
+            closestHitShader=VK_SHADER_UNUSED_KHR,
+            anyHitShader=VK_SHADER_UNUSED_KHR,
+            intersectionShader=VK_SHADER_UNUSED_KHR
         ))
-        return ShaderHandlerWrapper(self, len(self.rt_groups)-1)
+        s = ShaderHandlerWrapper()
+        self.rt_group_handles.append(s)
+        return s
 
     def set_max_recursion(self, depth):
         self.max_recursion_depth = depth
@@ -758,7 +787,7 @@ class PipelineBindingWrapper:
             VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: 1,
             VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: 1,
             VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER: 1,
-            VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_NV: 1,
+            VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR: 1,
         }
         for level in range(4):
             for slot, vk_stage, vk_descriptor_type, count, resolver in self.descriptor_sets_description[level]:
@@ -772,10 +801,10 @@ class PipelineBindingWrapper:
         ), pAllocator=None)
 
         self.descriptor_set_layouts = [vkCreateDescriptorSetLayout(self.w_device.vk_device,
-                                                                   VkDescriptorSetLayoutCreateInfo(
-                                                                       bindingCount=len(lb),
-                                                                       pBindings=lb
-                                                                   ), None) for lb in descriptor_set_layout_bindings]
+                                           VkDescriptorSetLayoutCreateInfo(
+                                               bindingCount=len(lb),
+                                               pBindings=lb
+                                           ), None) for lb in descriptor_set_layout_bindings]
 
         # Builds the descriptor sets (one group for each frame)
         descriptor_set_layouts_per_frame = self.descriptor_set_layouts * self.w_device.get_number_of_frames()
@@ -802,17 +831,29 @@ class PipelineBindingWrapper:
                                                                 )], None)[0]
         elif self.pipeline_type == VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO:
             pass
-        elif self.pipeline_type == VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_NV:
-            self.pipeline_object = self.w_device.vkCreateRayTracingPipelinesNV(self.w_device.vk_device, VK_NULL_HANDLE, 1,
-                                                                               [
-                                                                VkRayTracingPipelineCreateInfoNV(
-                                                                    layout=self.pipeline_layout,
-                                                                    stageCount=len(self.rt_shaders),
-                                                                    pStages=[s.vk_stage_info for s in self.rt_shaders],
-                                                                    groupCount=len(self.rt_groups),
-                                                                    pGroups=self.rt_groups,
-                                                                    maxRecursionDepth=self.max_recursion_depth
-                                                                )], None)[0]
+        elif self.pipeline_type == VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR:
+            self.pipeline_object = self.w_device.vkCreateRayTracingPipelines(
+                self.w_device.vk_device, VK_NULL_HANDLE,
+                VK_NULL_HANDLE, 1, VkRayTracingPipelineCreateInfoKHR(
+                                        layout=self.pipeline_layout,
+                                        stageCount=len(self.rt_shaders),
+                                        pStages=[s.vk_stage_info for s in self.rt_shaders],
+                                        groupCount=len(self.rt_groups),
+                                        pGroups=self.rt_groups,
+                                        maxPipelineRayRecursionDepth=self.max_recursion_depth
+                                    ), None)[0]
+            shader_handle_size = self.w_device.raytracing_properties.shaderGroupHandleSize
+            all_handles = bytearray(shader_handle_size * len(self.rt_groups))
+            self.w_device.vkGetRayTracingShaderGroupHandles(
+                self.w_device.vk_device,
+                self.pipeline_object,
+                0,
+                len(self.rt_groups),
+                len(self.rt_groups)*shader_handle_size,
+                ffi.from_buffer(all_handles)
+            )
+            for i, s in enumerate(self.rt_group_handles):
+                s._set_handle(all_handles[i*shader_handle_size:(i+1)*shader_handle_size])
         self.initialized = True
 
     def _set_at_cmdList(self, vk_cmdList, queue_index):
@@ -820,22 +861,25 @@ class PipelineBindingWrapper:
         self.current_queue_index = queue_index
         vkCmdBindPipeline(vk_cmdList, self.point, self.pipeline_object)
 
-    def _solve_resolver_as_buffers(self, buffer: ResourceWrapper):
-        return VkDescriptorBufferInfo(
-            buffer=buffer.resource_data.vk_resource,
-            offset=buffer.current_slice["offset"],
-            range=buffer.current_slice["size"]
-        )
+    def _solve_resolver_as_buffers(self, buffer: ResourceWrapper, vk_descriptor_type):
+        if vk_descriptor_type == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
+            return None
+        else:
+            return VkDescriptorBufferInfo(
+                buffer=buffer.resource_data.vk_resource,
+                offset=buffer.current_slice["offset"],
+                range=buffer.current_slice["size"]
+            )
 
     __SHADER_STAGE_2_PIPELINE_STAGE = {
         VK_SHADER_STAGE_VERTEX_BIT: VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
         VK_SHADER_STAGE_FRAGMENT_BIT: VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
         VK_SHADER_STAGE_COMPUTE_BIT: VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_SHADER_STAGE_ANY_HIT_BIT_NV: VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_NV,
-        VK_SHADER_STAGE_MISS_BIT_NV: VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_NV,
-        VK_SHADER_STAGE_CLOSEST_HIT_BIT_NV: VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_NV,
-        VK_SHADER_STAGE_INTERSECTION_BIT_NV: VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_NV,
-        VK_SHADER_STAGE_RAYGEN_BIT_NV: VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_NV,
+        VK_SHADER_STAGE_ANY_HIT_BIT_KHR: VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+        VK_SHADER_STAGE_MISS_BIT_KHR: VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+        VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR: VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+        VK_SHADER_STAGE_INTERSECTION_BIT_KHR: VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+        VK_SHADER_STAGE_RAYGEN_BIT_KHR: VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
     }
 
     def _solve_resolver_as_image(self, t, vk_descriptor_type, vk_shader_stage):
@@ -876,13 +920,21 @@ class PipelineBindingWrapper:
         descriptorWrites = []
         for slot, vk_stage, vk_descriptor_type, count, resolver in self.descriptor_sets_description[level]:
             is_buffer = vk_descriptor_type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER or \
-                    vk_descriptor_type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+                        vk_descriptor_type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER or\
+                        vk_descriptor_type == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR
+            next = None
+            if vk_descriptor_type == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:  # set next pointer
+                next = VkWriteDescriptorSetAccelerationStructureKHR(
+                    accelerationStructureCount=1,
+                    pAccelerationStructures=[resolver()[0].w_resource.resource_data.ads]
+                )
             dw = VkWriteDescriptorSet(
+                pNext=next,
                 dstSet=self.descriptor_sets[frame*4 + level],
                 dstBinding=slot,
                 descriptorType=vk_descriptor_type,
                 descriptorCount=count,
-                pBufferInfo=[self._solve_resolver_as_buffers(b.w_resource) for b in resolver()] if is_buffer else None,
+                pBufferInfo=[self._solve_resolver_as_buffers(b.w_resource, vk_descriptor_type) for b in resolver()] if is_buffer and next is None else None,
                 pImageInfo=[self._solve_resolver_as_image(t, vk_descriptor_type, vk_stage)
                             for t in resolver()] if not is_buffer else None
             )
@@ -926,13 +978,16 @@ class CommandBufferWrapper:
         self.__is_frozen = False
         self.state = CommandListState.INITIAL
         self.current_pipeline = None
+        self.shader_groups_size = self.pool.device.raytracing_properties.shaderGroupHandleSize
 
     @trace_destroying
     def __del__(self):
         self.current_pipeline = None
+        self.current_program = None
         self.pool = None
 
-    vkCmdBuildAccelerationStructureNV=None
+    vkCmdBuildAccelerationStructures=None
+    vkCmdTraceRays=None
 
     def begin(self):
         assert self.state == CommandListState.INITIAL, "Error, to begin a cmdList should be in initial state"
@@ -997,6 +1052,30 @@ class CommandBufferWrapper:
     def to_gpu(self, w_resource: ResourceWrapper):
         w_resource.add_transfer_to_gpu(self.vk_cmdList)
 
+    def copy_image(self, w_src: ResourceWrapper, w_dst: ResourceWrapper):
+        w_src.add_barrier(self.vk_cmdList, ResourceState(
+            vk_access=VK_ACCESS_TRANSFER_READ_BIT,
+            vk_stage=VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            vk_layout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            queue_index=VK_QUEUE_FAMILY_IGNORED))
+        w_dst.add_barrier(self.vk_cmdList, ResourceState(
+            vk_access=VK_ACCESS_TRANSFER_WRITE_BIT,
+            vk_stage=VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            vk_layout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            queue_index=VK_QUEUE_FAMILY_IGNORED))
+        subresource_index = w_src.current_slice["array_start"] + w_src.current_slice["mip_start"] * w_src.resource_data.full_slice["array_count"]
+        footprint, offset = w_src.resource_data.get_staging_footprint_and_offset(subresource_index)
+        w, h, d = footprint.dim
+        vkCmdCopyImage(self.vk_cmdList, w_src.resource_data.vk_resource, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       w_dst.resource_data.vk_resource, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, [
+                VkImageCopy(
+                    ResourceWrapper.get_subresource_layers(w_src.current_slice),
+                    VkOffset3D(0,0,0),
+                    ResourceWrapper.get_subresource_layers(w_dst.current_slice),
+                    VkOffset3D(0,0,0), VkExtent3D(w, h, d)
+                )
+                       ])
+
     def set_pipeline(self, pipeline: PipelineBindingWrapper):
         self.current_pipeline = pipeline
         pipeline._set_at_cmdList(self.vk_cmdList, self.pool.queue_index)
@@ -1007,28 +1086,57 @@ class CommandBufferWrapper:
     def dispatch_groups(self, dimx, dimy, dimz):
         vkCmdDispatch(self.vk_cmdList, dimx, dimy, dimz)
 
+    def _get_strided_device_address(self, w_resource: ResourceWrapper, stride):
+        if w_resource is None:
+            return w_resource
+        address = self.pool.device._get_device_address(w_resource)
+        return VkStridedDeviceAddressRegionKHR(
+            address.deviceAddress, stride, w_resource.current_slice["size"]
+        )
 
-    def build_ads(self, w_ads: ResourceWrapper, ads_info, is_top: bool,
-                  w_instance_buffer: ResourceWrapper,
+    def dispatch_rays(self,
+                      w_raygen_table: ResourceWrapper,
+                      w_raymiss_table: ResourceWrapper,
+                      w_rayhit_table: ResourceWrapper,
+                      dimx: int, dimy: int, dimz: int):
+        CommandBufferWrapper.vkCmdTraceRays(
+            self.vk_cmdList,
+            self._get_strided_device_address(w_raygen_table, self.shader_groups_size),
+            self._get_strided_device_address(w_raymiss_table, self.shader_groups_size),
+            self._get_strided_device_address(w_rayhit_table, self.shader_groups_size),
+            VkStridedDeviceAddressRegionKHR(),
+            dimx, dimy, dimz
+        )
+
+    def build_ads(self,
+                  w_ads: ResourceWrapper,
+                  ads_info: VkAccelerationStructureBuildGeometryInfoKHR,
+                  ads_ranges,
                   w_scratch: ResourceWrapper):
-        if is_top:
-            CommandBufferWrapper.vkCmdBuildAccelerationStructureNV(
-                self.vk_cmdList,
-                ads_info,
-                w_instance_buffer.resource_data.vk_resource, w_instance_buffer.current_slice["offset"], False,
-                w_ads.resource_data.vk_resource,  # dst
-                VK_NULL_HANDLE,  # src
-                w_scratch.resource_data.vk_resource, 0  # scratch
-            )
-        else:
-            CommandBufferWrapper.vkCmdBuildAccelerationStructureNV(
-                self.vk_cmdList,
-                ads_info,
-                VK_NULL_HANDLE, 0, False,
-                w_ads.resource_data.vk_resource,        # dst
-                VK_NULL_HANDLE,                         # src
-                w_scratch.resource_data.vk_resource, 0  # scratch
-            )
+        build_info = VkAccelerationStructureBuildGeometryInfoKHR(
+            type = ads_info.type,
+            geometryCount=ads_info.geometryCount,
+            pGeometries=ads_info.pGeometries,
+            scratchData=self.pool.device._get_device_address(w_scratch),
+            dstAccelerationStructure=w_ads.resource_data.ads,
+            mode=VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR,
+            flags=0
+        )
+        CommandBufferWrapper.vkCmdBuildAccelerationStructures(
+            self.vk_cmdList,
+            1,
+            build_info,
+            ads_ranges
+        )
+        vkCmdPipelineBarrier(self.vk_cmdList,
+                             VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                             VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                             0, 1,
+                             [
+                                 VkMemoryBarrier(
+                                srcAccessMask=VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
+                                dstAccessMask=VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR
+                                )], 0, 0, 0, 0)
 
 
 class GPUTaskWrapper:
@@ -1096,7 +1204,8 @@ class CommandPoolWrapper:
 
     @trace_destroying
     def __del__(self):
-        vkFreeCommandBuffers(self.vk_device, self.vk_pool, len(self.reusable), self.reusable)
+        if len(self.reusable) > 0:
+            vkFreeCommandBuffers(self.vk_device, self.vk_pool, len(self.reusable), self.reusable)
         if self.vk_pool:
             vkDestroyCommandPool(self.vk_device, self.vk_pool, None)
         [vkDestroyFence(self.vk_device, fence, None) for fence in self.reusable_fences]
@@ -1291,17 +1400,21 @@ class DeviceWrapper:
         self.vkDestroyDebugReportCallbackEXT = vkGetInstanceProcAddr(self.__instance, "vkDestroyDebugReportCallbackEXT")
         self.vkDestroySwapchainKHR = vkGetInstanceProcAddr(self.__instance, "vkDestroySwapchainKHR")
         self.vkDestroySurfaceKHR = vkGetInstanceProcAddr(self.__instance, "vkDestroySurfaceKHR")
-        self.vkCreateRayTracingPipelinesNV = vkGetInstanceProcAddr(self.__instance, "vkCreateRayTracingPipelinesNV")
-        self.vkGetAccelerationStructureHandleNV = \
-            vkGetInstanceProcAddr(self.__instance, "vkGetAccelerationStructureHandleNV")
-        self.vkCreateAccelerationStructureNV = vkGetInstanceProcAddr(self.__instance, "vkCreateAccelerationStructureNV")
-        self.vkGetAccelerationStructureMemoryRequirementsNV = vkGetInstanceProcAddr(
-            self.__instance, "vkGetAccelerationStructureMemoryRequirementsNV")
-        self.vkBindAccelerationStructureMemoryNV = vkGetInstanceProcAddr(
-            self.__instance, "vkBindAccelerationStructureMemoryNV")
-        CommandBufferWrapper.vkCmdBuildAccelerationStructureNV = \
-            vkGetInstanceProcAddr(self.__instance, "vkCmdBuildAccelerationStructureNV")
+
+        self.vkCreateRayTracingPipelines = vkGetInstanceProcAddr(self.__instance, "vkCreateRayTracingPipelinesKHR")
+        self.vkGetRayTracingShaderGroupHandles = \
+            vkGetInstanceProcAddr(self.__instance, "vkGetRayTracingShaderGroupHandlesKHR")
+        CommandBufferWrapper.vkCmdTraceRays = vkGetInstanceProcAddr(self.__instance, "vkCmdTraceRaysKHR")
+        self.vkGetAccelerationStructureDeviceAddress = \
+            vkGetInstanceProcAddr(self.__instance, "vkGetAccelerationStructureDeviceAddressKHR")
+        self.vkCreateAccelerationStructureKHR = vkGetInstanceProcAddr(self.__instance, "vkCreateAccelerationStructureKHR")
+        self.vkGetAccelerationStructureBuildSizesKHR = vkGetInstanceProcAddr(
+            self.__instance, "vkGetAccelerationStructureBuildSizesKHR")
+        CommandBufferWrapper.vkCmdBuildAccelerationStructures = \
+            vkGetInstanceProcAddr(self.__instance, "vkCmdBuildAccelerationStructuresKHR")
         self.vkGetPhysicalDeviceProperties2=vkGetInstanceProcAddr(self.__instance, "vkGetPhysicalDeviceProperties2KHR")
+        ResourceData.vkDestroyAccelerationStructure = vkGetInstanceProcAddr(self.__instance,
+                                                                                 "vkDestroyAccelerationStructureKHR")
 
     def __createSwapchain(self):
         self.__render_target_extent = VkExtent2D(self.width, self.height)
@@ -1402,17 +1515,41 @@ class DeviceWrapper:
         # Add here required extensions
         extensions = [
             VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-            VK_NV_RAY_TRACING_EXTENSION_NAME,
             "VK_KHR_acceleration_structure",
             "VK_KHR_ray_tracing_pipeline",
-            "VK_KHR_deferred_host_operations"
+            "VK_KHR_ray_query",
+            "VK_KHR_pipeline_library",
+            "VK_KHR_deferred_host_operations",
+            "VK_KHR_buffer_device_address"
+            # "GLSL_EXT_ray_tracing",
+            # "GLSL_EXT_ray_query",
+            # "GLSL_EXT_ray_flags_primitive_culling",
+            # "SPV_KHR_ray_tracing",
+            # "SPV_KHR_ray_query"
         ]
+
+        dev_features = self.__physical_devices_features[self.__physical_device]
+
+        ads_features = VkPhysicalDeviceAccelerationStructureFeaturesKHR(
+            accelerationStructure=True,
+        )
+
+        rt_features = VkPhysicalDeviceRayTracingPipelineFeaturesKHR(
+            pNext = ads_features,
+            rayTracingPipeline=True,
+        )
+
+        features = VkPhysicalDeviceVulkan12Features(
+            pNext=rt_features,
+            bufferDeviceAddress=True,
+        )
 
         device_create = VkDeviceCreateInfo(
             sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+            pNext=VkPhysicalDeviceFeatures2(pNext=features, features=dev_features),
             pQueueCreateInfos=queues_create,
             queueCreateInfoCount=len(queues_create),
-            pEnabledFeatures=self.__physical_devices_features[self.__physical_device],
+            # pEnabledFeatures=self.__physical_devices_features[self.__physical_device],
             flags=0,
             enabledLayerCount=len(self.__layers),
             ppEnabledLayerNames=self.__layers,
@@ -1420,6 +1557,11 @@ class DeviceWrapper:
             ppEnabledExtensionNames=extensions
         )
         self.vk_device = vkCreateDevice(self.__physical_device, device_create, None)
+
+        # load calls
+        self.vkGetBufferDeviceAddress = vkGetDeviceProcAddr(self.vk_device, "vkGetBufferDeviceAddressKHR")
+
+
         self.__queues = [None if qf.queueCount == 0 else vkGetDeviceQueue(
             device=self.vk_device,
             queueFamilyIndex=i,
@@ -1562,7 +1704,7 @@ class DeviceWrapper:
         appInfo = VkApplicationInfo(
             # sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,
             pApplicationName='Rendering with Python VK',
-            applicationVersion=VK_MAKE_VERSION(1, 0, 0),
+            applicationVersion=VK_MAKE_VERSION(1, 2, 0),
             pEngineName='pyvulkan',
             engineVersion=VK_MAKE_VERSION(1, 2, 0),
             apiVersion=VK_MAKE_VERSION(1, 2, 0)
@@ -1594,12 +1736,12 @@ class DeviceWrapper:
                                        for physical_device in physical_devices}
         self.__physical_device = physical_devices[0]
 
-        rt_prop = VkPhysicalDeviceRayTracingPropertiesNV()
-        prop = VkPhysicalDeviceProperties2(pNext=rt_prop)
+        rt_prop = VkPhysicalDeviceRayTracingPipelinePropertiesKHR()
+        vk12_prop = VkPhysicalDeviceVulkan12Properties(pNext=rt_prop)
+        prop = VkPhysicalDeviceProperties2(pNext=vk12_prop)
         self.vkGetPhysicalDeviceProperties2(self.__physical_device, prop)
-
         self.raytracing_properties = rt_prop
-
+        major, minor = VK_VERSION_MAJOR(prop.properties.apiVersion), VK_VERSION_MINOR(prop.properties.apiVersion)
         print("[INFO] Available devices: %s" % [p.deviceName
                                                 for p in physical_devices_properties.values()])
         print("[INFO] Selected device: %s\n" % physical_devices_properties[self.__physical_device].deviceName)
@@ -1693,6 +1835,13 @@ class DeviceWrapper:
         raise Exception("failed to find suitable memory type!")
 
     def __resolve_initial_state(self, is_buffer, usage, properties):
+        if usage == VK_BUFFER_USAGE_STORAGE_BUFFER_BIT:
+            return ResourceState(
+                vk_access=VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
+                vk_stage=VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                vk_layout=VK_IMAGE_LAYOUT_UNDEFINED,
+                queue_index=VK_QUEUE_FAMILY_IGNORED
+            )
         return ResourceState(
             vk_access=VK_ACCESS_TRANSFER_WRITE_BIT,
             vk_stage=VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
@@ -1709,6 +1858,7 @@ class DeviceWrapper:
         buffer = vkCreateBuffer(self.vk_device, info, None)
         mem_reqs = vkGetBufferMemoryRequirements(self.vk_device, buffer)
         allocInfo = VkMemoryAllocateInfo(allocationSize=mem_reqs.size,
+                                         pNext=None if not usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT else VkMemoryAllocateFlagsInfo(flags=VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT),
                                          memoryTypeIndex=self.__findMemoryType(mem_reqs.memoryTypeBits, properties))
         buffer_memory = vkAllocateMemory(self.vk_device, allocInfo, None)
         vkBindBufferMemory(self.vk_device, buffer, buffer_memory, 0)
@@ -1718,84 +1868,106 @@ class DeviceWrapper:
     def create_buffer(self, size, usage, properties):
         return ResourceWrapper(resource_data=self.create_buffer_data(size, usage, properties))
 
-    def create_ads(self, geometry_type=0, descriptions=[], instances=0,
-                   memory_type: int = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT):
-        # Create object
-        vk_descriptions = []
-        if geometry_type == 0:  # Triangles
-            vk_descriptions = [
-                VkGeometryNV(
-                    geometryType=geometry_type,
-                    geometry=VkGeometryDataNV(
-                        aabbs=VkGeometryAABBNV(),
-                        triangles=VkGeometryTrianglesNV(
-                            vertexData=v_w_resource.resource_data.vk_resource,
-                            vertexOffset=v_w_resource.current_slice["offset"],
-                            vertexStride=v_stride,
-                            vertexCount=v_w_resource.current_slice["size"] // v_stride,
-                            indexType=VK_INDEX_TYPE_UINT32,
-                            indexData=VK_NULL_HANDLE if i_w_resource is None else i_w_resource.resource_data.vk_resource,
-                            indexCount=0 if i_w_resource is None else i_w_resource.current_slice['size'] // 4,
-                            indexOffset=0 if i_w_resource is None else i_w_resource.current_slice['offset'],
-                            transformData=VK_NULL_HANDLE if t_w_resource is None else t_w_resource.resource_data.vk_resource,
-                            transformOffset=0 if t_w_resource is None else t_w_resource.current_slice["offset"],
-                            vertexFormat=VK_FORMAT_R32G32B32_SFLOAT
-                        )
-                    )
-                ) for v_w_resource,
-                      v_stride,
-                      i_w_resource,
-                      t_w_resource
-                      in descriptions
-            ]
+    def _get_device_address(self, buffer):
+        if buffer is None:
+            return None
+        device_address = self.vkGetBufferDeviceAddress(self.vk_device, VkBufferDeviceAddressInfo(
+            buffer=buffer.resource_data.vk_resource
+        ))
+        return VkDeviceOrHostAddressKHR(deviceAddress=device_address + buffer.current_slice["offset"])
+
+    def _get_device_address_const(self, buffer):
+        if buffer is None:
+            return None
+        device_address = self.vkGetBufferDeviceAddress(self.vk_device, VkBufferDeviceAddressInfo(
+            buffer=buffer.resource_data.vk_resource
+        ))
+        return VkDeviceOrHostAddressConstKHR(deviceAddress=device_address + buffer.current_slice["offset"])
+
+
+    def _resolve_description(self, geometry_type, element_description):
+        if geometry_type == VK_GEOMETRY_TYPE_TRIANGLES_KHR:
+            v, v_stride, i, t = element_description
+            max_vertex = v.get_size() // v_stride
+            data = VkAccelerationStructureGeometryKHR(
+                geometryType=geometry_type,
+                geometry=VkAccelerationStructureGeometryDataKHR(
+                triangles= VkAccelerationStructureGeometryTrianglesDataKHR(
+                vertexFormat=VK_FORMAT_R32G32B32_SFLOAT,
+                vertexData=self._get_device_address_const(v),
+                vertexStride=v_stride,
+                maxVertex=max_vertex,
+                indexType=VK_INDEX_TYPE_UINT32,
+                indexData=self._get_device_address_const(i),
+                transformData=self._get_device_address_const(t)
+            )))
+            if i:
+                primitives = i.get_size() // 4 // 3
+            else:
+                primitives = v.get_size() // v_stride // 3
+        elif geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR:
+            aabbs = element_description
+            data = VkAccelerationStructureGeometryKHR(
+                geometryType=geometry_type,
+                geometry=VkAccelerationStructureGeometryDataKHR(
+                aabbs=VkAccelerationStructureGeometryAabbsDataKHR(
+                stride=24,
+                data=self._get_device_address_const(aabbs)
+            )))
+            primitives = aabbs.get_size() // 24
         else:
-            vk_descriptions = []  #TODO: AABB support
+            instances = element_description
+            data = VkAccelerationStructureGeometryKHR(
+                geometryType=geometry_type,
+                geometry=VkAccelerationStructureGeometryDataKHR(
+                instances=VkAccelerationStructureGeometryInstancesDataKHR(
+                data=self._get_device_address_const(instances),
+                arrayOfPointers=False
+            )))
+            primitives = instances.get_size() // 64
 
-        acc_info = VkAccelerationStructureInfoNV(
-            type=VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_NV
-            if len(vk_descriptions) > 0
-            else VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_NV,
-            geometryCount=len(vk_descriptions),
-            pGeometries=vk_descriptions,
-            instanceCount=instances
+        range = VkAccelerationStructureBuildRangeInfoKHR(
+            primitiveCount=primitives,
+            primitiveOffset=0,
+            transformOffset=0,
+            firstVertex=0
         )
+        return data, range
 
-        info = VkAccelerationStructureCreateInfoNV(
-            compactedSize=0,
-            info=acc_info)
-        ads = self.vkCreateAccelerationStructureNV(self.vk_device, info, None)
-        # Create memory
-        mem_req_info = VkAccelerationStructureMemoryRequirementsInfoNV(
-            accelerationStructure=ads,
-            type=VK_ACCELERATION_STRUCTURE_MEMORY_REQUIREMENTS_TYPE_OBJECT_NV)
-        mem_req = self.vkGetAccelerationStructureMemoryRequirementsNV(self.vk_device, mem_req_info)
-        mem_alloc_info = VkMemoryAllocateInfo(
-            allocationSize=mem_req.memoryRequirements.size,
-            memoryTypeIndex=memory_type
+    def create_ads(self, geometry_type=0, descriptions=[]):
+        """
+        for triangles a description is a tuple in the form (v, v_stride, i, t). From there a rangeinfo can be extracted
+        for aabbs a decsription is directly the aabb buffer
+        for instances a description is directly the instance buffer
+        """
+        # Compute the required size of the buffer and the scratch buffer
+        structure_type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR if geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR else VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR
+        datas, ranges = zip(*[list(self._resolve_description(geometry_type, d)) for d in descriptions])
+        info = VkAccelerationStructureBuildGeometryInfoKHR(
+            type=structure_type,
+            geometryCount=len(descriptions),
+            pGeometries=datas
         )
-        buffer_memory = vkAllocateMemory(self.vk_device, mem_alloc_info, None)
-        # Bind object-memory
-        bind_info = VkBindAccelerationStructureMemoryInfoNV(
-            accelerationStructure=ads,
-            memory=buffer_memory,
-            memoryOffset=0
+        sizes = VkAccelerationStructureBuildSizesInfoKHR()
+        self.vkGetAccelerationStructureBuildSizesKHR(self.vk_device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+                                                     info, [range.primitiveCount for range in ranges], sizes)
+        # Create a buffer to store the ads
+        ads_buffer = self.create_buffer(sizes.accelerationStructureSize,
+                           VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR,
+                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+        # Create object
+        create_info = VkAccelerationStructureCreateInfoKHR(
+            buffer=ads_buffer.resource_data.vk_resource,
+            offset=0, size=sizes.accelerationStructureSize,
+            type=structure_type
         )
-        self.vkBindAccelerationStructureMemoryNV(self.vk_device, 1, [bind_info])
-        # Get Handle
-        handle = bytearray(8)
-        self.vkGetAccelerationStructureHandleNV(self.vk_device, ads, 8, ffi.from_buffer(handle))
+        ads = self.vkCreateAccelerationStructureKHR(self.vk_device, create_info, None)
+        ads_buffer.resource_data.bind_ads(ads)
 
-        mem_req_info = VkAccelerationStructureMemoryRequirementsInfoNV(
-            accelerationStructure=ads,
-            type=VK_ACCELERATION_STRUCTURE_MEMORY_REQUIREMENTS_TYPE_BUILD_SCRATCH_NV)
-        scratch_mem_req_info = self.vkGetAccelerationStructureMemoryRequirementsNV(
-            self.vk_device, mem_req_info)
+        query_device_address_info = VkAccelerationStructureDeviceAddressInfoKHR(accelerationStructure=ads)
+        device_address = self.vkGetAccelerationStructureDeviceAddress(self.vk_device, query_device_address_info)
 
-        resource = ResourceWrapper(ResourceData(
-            self, VkBufferCreateInfo(size=mem_req.memoryRequirements.size), memory_type, ads, buffer_memory, True,
-            self.__resolve_initial_state(True, VK_BUFFER_USAGE_RAY_TRACING_BIT_NV, memory_type)))
-
-        return resource, acc_info, handle, scratch_mem_req_info.memoryRequirements.size
+        return ads_buffer, info, ranges, device_address, max(sizes.buildScratchSize, sizes.updateScratchSize)
 
     def create_image(self, image_type, image_format, flags, extent, mips, layers, linear,
                      initial_layout, usage, properties):
@@ -1846,4 +2018,4 @@ class DeviceWrapper:
         return SamplerWrapper(vkCreateSampler(self.vk_device, info, None))
 
     def create_pipeline(self, vk_pipeline_type):
-        return PipelineBindingWrapper(device=self, pipeline_type=vk_pipeline_type)
+        return PipelineBindingWrapper(w_device=self, pipeline_type=vk_pipeline_type)
