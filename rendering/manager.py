@@ -822,20 +822,25 @@ class DeviceManager:
     def create_buffer(self, size: int, usage: int, memory: MemoryProperty):
         return Buffer(self.w_device.create_buffer(size, usage, memory))
 
-    def create_uniform(self, usage: int = BufferUsage.UNIFORM,
+    def create_uniform_buffer(self, usage: int = BufferUsage.UNIFORM,
                        memory: MemoryProperty = MemoryProperty.CPU_ACCESSIBLE,
                        **fields):
         layout, size = Uniform.process_layout(fields)
         resource = self.w_device.create_buffer(size, usage, memory)
-        # mapped_buffer = resource.resource_data.map_buffer_slice(0, size)
         return Uniform(resource, layout)
 
-    def create_structured_buffer(self, count:int, usage: int = BufferUsage.UNIFORM,
-                       memory: MemoryProperty = MemoryProperty.CPU_ACCESSIBLE,
-                       **fields):
+    def create_structured_buffer(self, count:int,
+                                    usage: int = BufferUsage.VERTEX | BufferUsage.TRANSFER_DST,
+                                    memory: MemoryProperty = MemoryProperty.GPU,
+                                    **fields):
         layout, size = Uniform.process_layout(fields)
         resource = self.w_device.create_buffer(size * count, usage, memory)
         return StructuredBuffer(resource, layout, size)
+
+    def create_indices_buffer(self, count: int,
+                              usage: int = BufferUsage.INDEX | BufferUsage.TRANSFER_DST,
+                              memory: MemoryProperty = MemoryProperty.GPU):
+        return IndexBuffer(self.w_device.create_buffer(count*4, usage, memory))
 
     def create_image(self, image_type: ImageType, is_cube: bool, image_format: Format,
                      width: int, height: int, depth: int,
@@ -847,20 +852,6 @@ class DeviceManager:
             image_type, image_format, VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT if is_cube else 0,
             VkExtent3D(width, height, depth), mips, layers, linear, layout, usage, memory
         ))
-
-    def create_buffer_vertex(self, vertex_size, vertex_count):
-        return self.create_buffer(
-            size=vertex_size * vertex_count,
-            usage=BufferUsage.VERTEX | BufferUsage.TRANSFER_DST,
-            memory=MemoryProperty.GPU
-        )
-
-    def create_buffer_index(self, index_count):
-        return self.create_buffer(
-            size=index_count * 4,
-            usage=BufferUsage.INDEX | BufferUsage.TRANSFER_DST,
-            memory=MemoryProperty.GPU
-        )
 
     def create_buffer_uniform(self, size):
         return self.create_buffer(
@@ -905,11 +896,11 @@ class DeviceManager:
         )
         return ADS(ads, handle, scratch_size, info, ranges)
 
-    def create_instance_buffer(self, instances: int):
-        instance_buffer = self.w_device.create_buffer(instances*64,
-                                             BufferUsage.RAYTRACING_ADS_READ | BufferUsage.TRANSFER_DST | BufferUsage.TRANSFER_SRC,
-                                             MemoryProperty.CPU_ACCESSIBLE | MemoryProperty.CPU_DIRECT)
-        return InstanceBuffer(instance_buffer, instances)
+    def create_instance_buffer(self, instances: int, memory: MemoryProperty = MemoryProperty.GPU):
+        buffer = self.w_device.create_buffer(instances*64,
+                                             BufferUsage.RAYTRACING_ADS_READ | BufferUsage.TRANSFER_DST,
+                                             memory)
+        return InstanceBuffer(buffer, instances)
 
     def create_scratch_buffer(self, *ads_set):
         size = max(a.scratch_size for a in ads_set)

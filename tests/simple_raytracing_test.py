@@ -15,15 +15,15 @@ def render():
                                  debug=True)
 
     vertices = presenter.create_structured_buffer(3,
-                                       BufferUsage.RAYTRACING_ADS_READ,
-                                       MemoryProperty.CPU_DIRECT | MemoryProperty.CPU_ACCESSIBLE, position=vec3)
+                                       BufferUsage.RAYTRACING_ADS_READ | BufferUsage.TRANSFER_DST,
+                                       MemoryProperty.GPU, position=vec3)
     vertices.write([ vec3(-0.6, -0.6, 0), vec3(0.6, -0.6, 0), vec3(0, 0.6, 0) ])  # TODO: Write a write_direct, read_direct
     with presenter.get_raytracing() as man:
          man.cpu_to_gpu(vertices)
 
-    geometry = presenter.create_triangle_collection()
-    geometry.append(vertices)
-    geometry_ads = presenter.create_geometry_ads(geometry)
+    geometries = presenter.create_triangle_collection()
+    geometries.append(vertices)
+    geometries_ads = presenter.create_geometry_ads(geometries)
 
     scene_buffer = presenter.create_instance_buffer(1)
 
@@ -32,14 +32,17 @@ def render():
     scene_buffer[0].id = 0
     scene_buffer[0].offset = 0
     scene_buffer[0].flags = 0
-    scene_buffer[0].geometry = geometry_ads
+    scene_buffer[0].geometry = geometries_ads
+
+    with presenter.get_raytracing() as man:
+         man.cpu_to_gpu(scene_buffer)
 
     scene_ads = presenter.create_scene_ads(scene_buffer)
 
-    scratch_buffer = presenter.create_scratch_buffer(geometry_ads, scene_ads)
+    scratch_buffer = presenter.create_scratch_buffer(geometries_ads, scene_ads)
 
     with presenter.get_raytracing() as man:
-        man.build_ads(geometry_ads, scratch_buffer)
+        man.build_ads(geometries_ads, scratch_buffer)
         man.build_ads(scene_ads, scratch_buffer)
 
     pipeline = presenter.create_raytracing_pipeline()
@@ -55,7 +58,7 @@ def render():
     pipeline.bind_storage_image(1, ShaderStage.RT_GENERATION, lambda: presenter.render_target())
     pipeline.close()
 
-    program = pipeline.create_rt_program(10, 100)
+    program = pipeline.create_rt_program(2, 1)
     program.set_generation(gen_group)
     program.set_hit_group(0, hit_group)
     program.set_miss(1, miss_group)
