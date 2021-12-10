@@ -13,7 +13,7 @@ from enum import Enum
 import numpy as np
 
 
-__TRACE__ = False
+__TRACE__ = True
 
 def trace_destroying(function):
     def wrapper(self, *args):
@@ -1107,12 +1107,26 @@ class CommandBufferWrapper:
             VkStridedDeviceAddressRegionKHR(),
             dimx, dimy, dimz
         )
+        vkCmdPipelineBarrier(self.vk_cmdList, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             0, 1, VkMemoryBarrier(
+                srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT,
+                dstAccessMask=VK_ACCESS_SHADER_READ_BIT
+            ), 0, 0, 0, 0)
 
     def build_ads(self,
                   w_ads: ResourceWrapper,
                   ads_info: VkAccelerationStructureBuildGeometryInfoKHR,
                   ads_ranges,
                   w_scratch: ResourceWrapper):
+        vkCmdPipelineBarrier(self.vk_cmdList,
+                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                             0, 1,
+                             VkMemoryBarrier(
+                                 srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT,
+                                 dstAccessMask=VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR
+                             ), 0, 0, 0, 0)
+
         build_info = VkAccelerationStructureBuildGeometryInfoKHR(
             type = ads_info.type,
             geometryCount=ads_info.geometryCount,
@@ -1120,23 +1134,22 @@ class CommandBufferWrapper:
             scratchData=self.pool.device._get_device_address(w_scratch),
             dstAccelerationStructure=w_ads.resource_data.ads,
             mode=VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR,
-            flags=0
+            flags=VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR
         )
         CommandBufferWrapper.vkCmdBuildAccelerationStructures(
             self.vk_cmdList,
             1,
-            build_info,
-            ads_ranges
+            [build_info],
+            [ads_ranges]
         )
         vkCmdPipelineBarrier(self.vk_cmdList,
                              VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
                              VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
                              0, 1,
-                             [
                                  VkMemoryBarrier(
                                 srcAccessMask=VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
                                 dstAccessMask=VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR
-                                )], 0, 0, 0, 0)
+                                ), 0, 0, 0, 0)
 
 
 class GPUTaskWrapper:
@@ -1305,6 +1318,7 @@ class CommandPoolWrapper:
         vkResetFences(device=self.vk_device, fenceCount=1, pFences=[gpu_task.fence])
         self.reusable_fences.append(gpu_task.fence)
         gpu_task.fence = None  # Set finished
+        # vkQueueWaitIdle(self.vk_queue)
 
 
 class Event(Enum):
@@ -1735,8 +1749,8 @@ class DeviceWrapper:
         physical_devices_properties = {physical_device: vkGetPhysicalDeviceProperties(physical_device)
                                        for physical_device in physical_devices}
         self.__physical_device = physical_devices[0]
-
-        rt_prop = VkPhysicalDeviceRayTracingPipelinePropertiesKHR()
+        ads_prop=VkPhysicalDeviceAccelerationStructurePropertiesKHR()
+        rt_prop = VkPhysicalDeviceRayTracingPipelinePropertiesKHR(pNext=ads_prop)
         vk12_prop = VkPhysicalDeviceVulkan12Properties(pNext=rt_prop)
         prop = VkPhysicalDeviceProperties2(pNext=vk12_prop)
         self.vkGetPhysicalDeviceProperties2(self.__physical_device, prop)
@@ -1945,6 +1959,7 @@ class DeviceWrapper:
         datas, ranges = zip(*[list(self._resolve_description(geometry_type, d)) for d in descriptions])
         info = VkAccelerationStructureBuildGeometryInfoKHR(
             type=structure_type,
+            mode=VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR,
             geometryCount=len(descriptions),
             pGeometries=datas
         )
@@ -1953,7 +1968,7 @@ class DeviceWrapper:
                                                      info, [range.primitiveCount for range in ranges], sizes)
         # Create a buffer to store the ads
         ads_buffer = self.create_buffer(sizes.accelerationStructureSize,
-                           VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR,
+                           VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
         # Create object
         create_info = VkAccelerationStructureCreateInfoKHR(

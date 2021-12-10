@@ -1,4 +1,5 @@
 from rendering.manager import *
+from rendering.scenes import *
 from glm import *
 import matplotlib.pyplot as plt
 
@@ -14,36 +15,19 @@ def render():
                                  usage=ImageUsage.STORAGE | ImageUsage.TRANSFER_SRC | ImageUsage.TRANSFER_DST,
                                  debug=True)
 
-    vertices = presenter.create_structured_buffer(3,
-                                       BufferUsage.RAYTRACING_ADS_READ | BufferUsage.TRANSFER_DST,
-                                       MemoryProperty.GPU, position=vec3)
-    vertices.write([ vec3(-0.6, -0.6, 0), vec3(0.6, -0.6, 0), vec3(0, 0.6, 0) ])  # TODO: Write a write_direct, read_direct
-    with presenter.get_raytracing() as man:
-         man.cpu_to_gpu(vertices)
-
-    geometries = presenter.create_triangle_collection()
-    geometries.append(vertices)
-    geometries_ads = presenter.create_geometry_ads(geometries)
-
-    scene_buffer = presenter.create_instance_buffer(1)
-
-    scene_buffer[0].transform = mat3x4( 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0)
-    scene_buffer[0].mask = 0xff
-    scene_buffer[0].id = 0
-    scene_buffer[0].offset = 0
-    scene_buffer[0].flags = 0
-    scene_buffer[0].geometry = geometries_ads
-
-    with presenter.get_raytracing() as man:
-         man.cpu_to_gpu(scene_buffer)
-
-    scene_ads = presenter.create_scene_ads(scene_buffer)
-
-    scratch_buffer = presenter.create_scratch_buffer(geometries_ads, scene_ads)
-
-    with presenter.get_raytracing() as man:
-        man.build_ads(geometries_ads, scratch_buffer)
-        man.build_ads(scene_ads, scratch_buffer)
+    scene_builder = SceneBuilder(device=presenter)
+    # scene_builder.add_vertex(vec3(-0.6, -0.6, 0))
+    # scene_builder.add_vertex(vec3(0.6, -0.6, 0))
+    # scene_builder.add_vertex(vec3(0.6, 0.6, 0))
+    # scene_builder.add_vertex(vec3(-0.6, 0.6, 0))
+    # scene_builder.add_indices([0, 1, 2, 0, 2, 3])
+    # geometry1 = scene_builder.add_geometry(0, 3)
+    # geometry2 = scene_builder.add_geometry(3, 6)
+    # geometry = scene_builder.add_geometry_obj("./models/sphereBoxScene.obj")
+    geometry = scene_builder.add_geometry_obj("./models/bunnyScene.obj")
+    scene_builder.add_instance([geometry], transform=glm.scale(glm.vec3(1.5, 1.5, -1.5)))
+    scene_builder.add_instance([geometry], transform=glm.translate(glm.vec3(.5, .5, -.5)))
+    raytracing_scene = scene_builder.build_raytracing_scene()
 
     pipeline = presenter.create_raytracing_pipeline()
     raygen = pipeline.load_rt_generation_shader('./shaders/test_basic_raygen.rgen.spv')
@@ -54,7 +38,7 @@ def render():
     miss_group = pipeline.create_rt_miss_group(raymiss)
     miss2_group = pipeline.create_rt_miss_group(raymiss2)
     hit_group = pipeline.create_rt_hit_group(rayhit)
-    pipeline.bind_scene_ads(0, ShaderStage.RT_GENERATION, lambda: scene_ads)
+    pipeline.bind_scene_ads(0, ShaderStage.RT_GENERATION | ShaderStage.RT_CLOSEST_HIT, lambda: raytracing_scene.scene_ads)
     pipeline.bind_storage_image(1, ShaderStage.RT_GENERATION, lambda: presenter.render_target())
     pipeline.close()
 

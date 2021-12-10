@@ -341,7 +341,7 @@ class IndexBuffer(Buffer):
     def __setitem__(self, key, value):
         assert isinstance(value, int) or isinstance(value, glm.uint32), "Only integers is supported"
         bytes = struct.pack('i', value)
-        self.w_resource.slice_buffer(key * 4, 4).writes(bytes)
+        self.w_resource.slice_buffer(key * 4, 4).write(bytes)
 
 
 class Image(Resource):
@@ -530,13 +530,14 @@ class InstanceBuffer(Resource):
 
 class ADS(Resource):
     def __init__(self, w_resource: vkw.ResourceWrapper, handle, scratch_size,
-                 info: VkAccelerationStructureCreateInfoKHR, ranges):
+                 info: VkAccelerationStructureCreateInfoKHR, ranges, instance_buffer = None):
         super().__init__(w_resource)
         self.ads = w_resource.resource_data.ads
         self.ads_info = info
         self.handle = handle
         self.scratch_size = scratch_size
         self.ranges = ranges
+        self.instance_buffer = instance_buffer
 
 
 class RTProgram:
@@ -684,7 +685,7 @@ class Pipeline:
 
         w_buffer = self.w_pipeline.w_device.create_buffer(
             raygen_size + raymiss_size + rayhit_size,
-            usage=VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
             properties=MemoryProperty.CPU_ACCESSIBLE | MemoryProperty.CPU_DIRECT)
         return RTProgram(self, w_buffer, raygen_size, raygen_size + raymiss_size)
 
@@ -720,10 +721,12 @@ class CopyManager(CommandManager):
         return QueueType.COPY
 
     def gpu_to_cpu(self, resource):
-        self.w_cmdList.from_gpu(resource.w_resource)
+        if resource:
+            self.w_cmdList.from_gpu(resource.w_resource)
 
     def cpu_to_gpu(self, resource):
-        self.w_cmdList.to_gpu(resource.w_resource)
+        if resource:
+            self.w_cmdList.to_gpu(resource.w_resource)
 
     def copy_image(self, src_image: Image, dst_image: Image):
         self.w_cmdList.copy_image(src_image.w_resource, dst_image.w_resource)
@@ -894,7 +897,7 @@ class DeviceManager:
                 instance_buffer.w_resource
             ]
         )
-        return ADS(ads, handle, scratch_size, info, ranges)
+        return ADS(ads, handle, scratch_size, info, ranges, instance_buffer)
 
     def create_instance_buffer(self, instances: int, memory: MemoryProperty = MemoryProperty.GPU):
         buffer = self.w_device.create_buffer(instances*64,
@@ -904,8 +907,8 @@ class DeviceManager:
 
     def create_scratch_buffer(self, *ads_set):
         size = max(a.scratch_size for a in ads_set)
-        return self.create_buffer(size, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR
-                                  | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        return self.create_buffer(size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                                  | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
                                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
 
     def create_render_target(self, image_format: Format, width: int, height: int):

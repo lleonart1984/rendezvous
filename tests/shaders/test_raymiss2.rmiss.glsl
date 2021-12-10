@@ -4,5 +4,5 @@
 layout(location = 0) rayPayloadInEXT vec4 ResultColor;
 
 void main() {
-    ResultColor = vec4(1, 0, 0.0f, 1.0);
+    ResultColor = vec4(1, 1.0, 0.0f, 1.0);
 }
