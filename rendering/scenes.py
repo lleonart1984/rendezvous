@@ -219,11 +219,11 @@ class SceneBuilder:
             s.vertices.write(vertex_cpu_data)
 
         # create indices
-        if True:
+        if False:
             s.indices = device.create_indices_buffer(
                 count=len(self.indices),
                 usage=BufferUsage.TRANSFER_DST | BufferUsage.STORAGE | BufferUsage.INDEX | BufferUsage.RAYTRACING_ADS_READ,
-                memory=MemoryProperty.GPU
+                memory=MemoryProperty.CPU_DIRECT
             )
             index_cpu_data = struct.pack('i'*len(self.indices), *self.indices)
             s.indices.write(index_cpu_data)
@@ -233,7 +233,7 @@ class SceneBuilder:
             s.transforms = device.create_structured_buffer(
                 count=len(self.transforms),
                 usage=BufferUsage.TRANSFER_DST | BufferUsage.STORAGE | BufferUsage.RAYTRACING_ADS_READ,
-                memory=MemoryProperty.GPU,
+                memory=MemoryProperty.CPU_DIRECT,
                 # Field
                 matrix=glm.mat3x4
             )
@@ -245,7 +245,7 @@ class SceneBuilder:
             s.material_buffer = device.create_structured_buffer(
                 count=len(self.materials),
                 usage=BufferUsage.TRANSFER_DST | BufferUsage.STORAGE,
-                memory=MemoryProperty.GPU,
+                memory=MemoryProperty.CPU_DIRECT,
                 # Fields
                 diffuse=glm.vec3,
                 opacity=float,
@@ -272,7 +272,7 @@ class SceneBuilder:
         # create bottom level ads, instance buffer and top level ads (scene_ads)
 
         instance_buffer = device.create_instance_buffer(len(self.instances),
-                                                        memory=MemoryProperty.GPU)
+                                                        memory=MemoryProperty.CPU_DIRECT)
 
         if True:
             s.geometry_descriptions = device.create_structured_buffer(
@@ -298,7 +298,7 @@ class SceneBuilder:
                         index_start, index_count, transform_index = self.geometries[geom_index]
                         geometry_collection.append(
                             s.vertices,
-                            s.indices.slice(index_start * 4, index_count * 4),
+                            None, # s.indices.slice(index_start * 4, index_count * 4),
                             None if transform_index == -1 else s.transforms.slice(transform_index*48, 48)
                         )
                     geometry_ads = device.create_geometry_ads(geometry_collection)
@@ -328,14 +328,14 @@ class SceneBuilder:
         scratch_buffers = [device.create_scratch_buffer(b) for b in to_build]
 
         with device.get_raytracing() as man:
-            # Transfer all buffers to gpu
-            man.cpu_to_gpu(instance_buffer)
-            man.cpu_to_gpu(s.vertices)
-            man.cpu_to_gpu(s.indices)
-            man.cpu_to_gpu(s.transforms)
-            man.cpu_to_gpu(s.material_buffer)
-            man.cpu_to_gpu(s.geometry_descriptions)
-            man.cpu_to_gpu(s.instance_descriptions)
+        #     # Transfer all buffers to gpu
+        #     man.cpu_to_gpu(instance_buffer)
+              man.cpu_to_gpu(s.vertices)
+        #     man.cpu_to_gpu(s.indices)
+        #     man.cpu_to_gpu(s.transforms)
+        #     man.cpu_to_gpu(s.material_buffer)
+        #     man.cpu_to_gpu(s.geometry_descriptions)
+        #     man.cpu_to_gpu(s.instance_descriptions)
 
         # BUILD all ADSs
         for i, ads in enumerate(to_build):

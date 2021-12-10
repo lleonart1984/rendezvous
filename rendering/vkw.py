@@ -413,7 +413,7 @@ class ResourceWrapper:
         self.current_slice = resource_slice
         self.is_readonly = False
 
-    @trace_destroying
+    # @trace_destroying
     def __del__(self):
         # Destroy view if any
         if self.vk_view:
@@ -987,6 +987,7 @@ class CommandBufferWrapper:
         self.pool = None
 
     vkCmdBuildAccelerationStructures=None
+    vkBuildAccelerationStructures = None
     vkCmdTraceRays=None
 
     def begin(self):
@@ -1007,7 +1008,7 @@ class CommandBufferWrapper:
         self.state = CommandListState.INITIAL
 
     def flush_and_wait(self):
-        self.pool.flush([self]).wait()
+        self.pool.flush([self])
 
     def freeze(self):
         if self.is_frozen():
@@ -1138,40 +1139,20 @@ class CommandBufferWrapper:
         )
         CommandBufferWrapper.vkCmdBuildAccelerationStructures(
             self.vk_cmdList,
+            # self.pool.vk_device,
+            # None,
             1,
-            [build_info],
+            build_info,
             [ads_ranges]
         )
-        vkCmdPipelineBarrier(self.vk_cmdList,
-                             VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-                             VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
-                             0, 1,
-                                 VkMemoryBarrier(
-                                srcAccessMask=VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
-                                dstAccessMask=VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR
-                                ), 0, 0, 0, 0)
-
-
-class GPUTaskWrapper:
-    def __init__(self, pool=None, cmdLists=[], fence=None):
-        self.fence = fence
-        self.pool = pool
-        self.cmdLists = cmdLists
-
-    def is_finished(self):
-        return self.fence is None
-
-    def wait(self):
-        if self.is_finished():
-            return
-        self.pool.wait(self)
-
-    @trace_destroying
-    def __del__(self):
-        self.wait()
-        self.fence = None
-        self.cmdLists = None
-        self.pool = None
+        # vkCmdPipelineBarrier(self.vk_cmdList,
+        #                      VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        #                      VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+        #                      0, 1,
+        #                          VkMemoryBarrier(
+        #                         srcAccessMask=VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
+        #                         dstAccessMask=VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR
+        #                         ), 0, 0, 0, 0)
 
 
 class ShaderStageWrapper:
@@ -1212,7 +1193,6 @@ class CommandPoolWrapper:
         self.vk_queue = vk_queue
         self.attached = []  # attached CommandBufferWrapper can be automatically flushed
         self.reusable = []  # commandlists have been submitted and finished that can be reused
-        self.reusable_fences = []
         self.queue_index = queue_index
 
     @trace_destroying
@@ -1221,19 +1201,10 @@ class CommandPoolWrapper:
             vkFreeCommandBuffers(self.vk_device, self.vk_pool, len(self.reusable), self.reusable)
         if self.vk_pool:
             vkDestroyCommandPool(self.vk_device, self.vk_pool, None)
-        [vkDestroyFence(self.vk_device, fence, None) for fence in self.reusable_fences]
         self.attached = []  # attached CommandBufferWrapper can be automatically flushed
         self.reusable = []  # commandlists have been submitted and finished that can be reused
-        self.reusable_fences = []
         self.device = None
 
-
-    def get_fence(self):
-        if len(self.reusable_fences) > 0:
-            return self.reusable_fences.pop()
-        fence = vkCreateFence(self.vk_device, VkFenceCreateInfo(flags=VK_FENCE_CREATE_SIGNALED_BIT), None)
-        vkResetFences(self.vk_device, 1, [fence])
-        return fence
 
     def get_cmdList(self):
         """"
@@ -1266,7 +1237,7 @@ class CommandPoolWrapper:
                     self.attached.remove(m)  # remove from attached
 
         if len(managers) == 0:
-            return GPUTaskWrapper()  # finished task
+            return  # finished task
 
         cmdLists = []
         for m in managers:
@@ -1284,41 +1255,22 @@ class CommandPoolWrapper:
             cmdLists.append(m.vk_cmdList)
             m.state = CommandListState.SUBMITTED
 
-        submit_fence = self.get_fence()
         vkQueueSubmit(self.vk_queue, 1,
-                      [
+
                           VkSubmitInfo(
                               commandBufferCount=len(cmdLists),
                               pCommandBuffers=cmdLists
-                          )]
-                      , submit_fence)
-        return GPUTaskWrapper(self, managers, submit_fence)
+                          )
+                      , None)
 
-    def wait(self, gpu_task):
-
-        if gpu_task.is_finished():
-            return
-
-        vkWaitForFences(
-            device=self.vk_device,
-            fenceCount=1,
-            pFences=[gpu_task.fence],
-            waitAll=VK_TRUE,
-            timeout=UINT64_MAX
-        )
-
-        for c in gpu_task.cmdLists:
+        vkQueueWaitIdle(self.vk_queue)
+        for c in managers:
             if c.is_frozen():
                 c.state = CommandListState.EXECUTABLE
             else:
                 vkResetCommandBuffer(c.vk_cmdList, VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT)
                 self.reusable.append(c.vk_cmdList)
                 c.state = CommandListState.FINISHED
-
-        vkResetFences(device=self.vk_device, fenceCount=1, pFences=[gpu_task.fence])
-        self.reusable_fences.append(gpu_task.fence)
-        gpu_task.fence = None  # Set finished
-        # vkQueueWaitIdle(self.vk_queue)
 
 
 class Event(Enum):
@@ -1426,6 +1378,8 @@ class DeviceWrapper:
             self.__instance, "vkGetAccelerationStructureBuildSizesKHR")
         CommandBufferWrapper.vkCmdBuildAccelerationStructures = \
             vkGetInstanceProcAddr(self.__instance, "vkCmdBuildAccelerationStructuresKHR")
+        CommandBufferWrapper.vkBuildAccelerationStructures = \
+            vkGetInstanceProcAddr(self.__instance, "vkBuildAccelerationStructuresKHR")
         self.vkGetPhysicalDeviceProperties2=vkGetInstanceProcAddr(self.__instance, "vkGetPhysicalDeviceProperties2KHR")
         ResourceData.vkDestroyAccelerationStructure = vkGetInstanceProcAddr(self.__instance,
                                                                                  "vkDestroyAccelerationStructureKHR")
@@ -1546,6 +1500,8 @@ class DeviceWrapper:
 
         ads_features = VkPhysicalDeviceAccelerationStructureFeaturesKHR(
             accelerationStructure=True,
+            # accelerationStructureHostCommands=True,
+            # descriptorBindingAccelerationStructureUpdateAfterBind=True,
         )
 
         rt_features = VkPhysicalDeviceRayTracingPipelineFeaturesKHR(
@@ -1791,7 +1747,7 @@ class DeviceWrapper:
 
     def flush_pending_and_wait(self):
         for m in self.__managers:
-            m.flush().wait()
+            m.flush()
 
     def end_frame(self):
         self.flush_pending_and_wait()
@@ -1888,7 +1844,9 @@ class DeviceWrapper:
         device_address = self.vkGetBufferDeviceAddress(self.vk_device, VkBufferDeviceAddressInfo(
             buffer=buffer.resource_data.vk_resource
         ))
-        return VkDeviceOrHostAddressKHR(deviceAddress=device_address + buffer.current_slice["offset"])
+        add = VkDeviceOrHostAddressKHR()
+        add.deviceAddress=device_address + buffer.current_slice["offset"]
+        return add
 
     def _get_device_address_const(self, buffer):
         if buffer is None:
@@ -1896,8 +1854,9 @@ class DeviceWrapper:
         device_address = self.vkGetBufferDeviceAddress(self.vk_device, VkBufferDeviceAddressInfo(
             buffer=buffer.resource_data.vk_resource
         ))
-        return VkDeviceOrHostAddressConstKHR(deviceAddress=device_address + buffer.current_slice["offset"])
-
+        add = VkDeviceOrHostAddressConstKHR()
+        add.deviceAddress=device_address + buffer.current_slice["offset"]
+        return add
 
     def _resolve_description(self, geometry_type, element_description):
         if geometry_type == VK_GEOMETRY_TYPE_TRIANGLES_KHR:

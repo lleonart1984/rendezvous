@@ -34,7 +34,6 @@ def compile_shader_sources(directory='.'):
 
 Event = vkw.Event
 Window = vkw.WindowWrapper
-GPUTask = vkw.GPUTaskWrapper
 Footprint = vkw.SubresourceFootprint
 ShaderHandler = vkw.ShaderHandlerWrapper
 
@@ -118,7 +117,7 @@ class MemoryProperty(IntFlag):
     """
     Memory can be read and write directly from the CPU
     """
-    CPU_DIRECT = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+    CPU_DIRECT = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
     """ 
     Memory efficient for reading on the CPU a cached device memory.
     """
