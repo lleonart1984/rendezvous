@@ -16,35 +16,8 @@ def render():
                                  debug=True)
 
     scene_builder = SceneBuilder(device=presenter)
-    N = 17025
-    for _ in range (N):
-        pos = vec3(np.random.uniform(), np.random.uniform(), np.random.uniform())*2-1
-        vertex_offset = scene_builder.get_vertex_offset()
-        scene_builder.add_vertex(vec3(pos.x-0.01, pos.y-0.01, pos.z))
-        scene_builder.add_vertex(vec3(pos.x+0.01, pos.y-0.01, pos.z))
-        scene_builder.add_vertex(vec3(pos.x+0.01, pos.y+0.01, pos.z))
-        scene_builder.add_vertex(vec3(pos.x-0.01, pos.y+0.01, pos.z))
-        scene_builder.add_vertex(vec3(pos.x+0.01, pos.y+0.01, pos.z))
-        scene_builder.add_vertex(vec3(pos.x+0.01, pos.y-0.01, pos.z))
-        # scene_builder.add_indices([0, 1, 2, 3, 4, 5], vertex_offset)
-    geometry1 = scene_builder.add_geometry(0, N*6)
-    # for _ in range (N):
-    #     pos = vec3(np.random.uniform(), np.random.uniform(), np.random.uniform())*2-1
-    #     vertex_offset = scene_builder.get_vertex_offset()
-    #     scene_builder.add_vertex(vec3(pos.x-0.01, pos.y-0.01, pos.z))
-    #     scene_builder.add_vertex(vec3(pos.x+0.01, pos.y-0.01, pos.z))
-    #     scene_builder.add_vertex(vec3(pos.x+0.01, pos.y+0.01, pos.z))
-    #     scene_builder.add_vertex(vec3(pos.x-0.01, pos.y+0.01, pos.z))
-    #     scene_builder.add_indices([0, 1, 2, 0, 2, 3], vertex_offset)
-    # geometry2 = scene_builder.add_geometry(N*6, N*6)
-    # geometry2 = scene_builder.add_geometry(3, 6)
-    # geometry1 = scene_builder.add_geometry_obj("./models/sphereBoxScene.obj")
-    # geometry1 = scene_builder.add_geometry_obj("./models/bunnyScene.obj")
-    # scene_builder.add_instance([geometry1], transform=glm.scale(glm.vec3(1.5, 1.5, -1.5)))
-    # scene_builder.add_instance([geometry1], transform=glm.scale(glm.vec3(.5, .5, -1.5)))
-    # scene_builder.add_instance([geometry1], transform=glm.scale(glm.vec3(2.5, .5, -1.5)))
-    # scene_builder.add_instance([geometry1], transform=glm.scale(glm.vec3(.15, .5, -1.5)))
-    scene_builder.add_instance([geometry1], transform=glm.scale(glm.vec3(1.0, 1.5, -1.5)))
+    geometry1 = scene_builder.add_geometry_obj("./models/pitagoras.obj")
+    scene_builder.add_instance([geometry1], transform=glm.scale(glm.vec3(1.5, 1.5, -1.5)))
     raytracing_scene = scene_builder.build_raytracing_scene()
 
     pipeline = presenter.create_raytracing_pipeline()

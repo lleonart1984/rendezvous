@@ -211,7 +211,7 @@ class SceneBuilder:
             )
             vertex_stride = s.vertices.stride
             vertex_cpu_data = bytearray(len(self.positions) * vertex_stride)
-            vertex_struct_format = "f"*14
+            vertex_struct_format = "f"*(vertex_stride//4)
             offset = 0
             for i, (v, n, t) in enumerate(zip(self.positions, self.normals, self.texcoords)):
                 vertex_cpu_data[offset:offset+vertex_stride] = struct.pack(vertex_struct_format, v.x, v.y, v.z, n.x, n.y, n.z, t.x, t.y, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
@@ -219,11 +219,11 @@ class SceneBuilder:
             s.vertices.write(vertex_cpu_data)
 
         # create indices
-        if False:
+        if True:
             s.indices = device.create_indices_buffer(
                 count=len(self.indices),
                 usage=BufferUsage.TRANSFER_DST | BufferUsage.STORAGE | BufferUsage.INDEX | BufferUsage.RAYTRACING_ADS_READ,
-                memory=MemoryProperty.CPU_DIRECT
+                memory=MemoryProperty.GPU
             )
             index_cpu_data = struct.pack('i'*len(self.indices), *self.indices)
             s.indices.write(index_cpu_data)
@@ -233,7 +233,7 @@ class SceneBuilder:
             s.transforms = device.create_structured_buffer(
                 count=len(self.transforms),
                 usage=BufferUsage.TRANSFER_DST | BufferUsage.STORAGE | BufferUsage.RAYTRACING_ADS_READ,
-                memory=MemoryProperty.CPU_DIRECT,
+                memory=MemoryProperty.GPU,
                 # Field
                 matrix=glm.mat3x4
             )
@@ -245,7 +245,7 @@ class SceneBuilder:
             s.material_buffer = device.create_structured_buffer(
                 count=len(self.materials),
                 usage=BufferUsage.TRANSFER_DST | BufferUsage.STORAGE,
-                memory=MemoryProperty.CPU_DIRECT,
+                memory=MemoryProperty.GPU,
                 # Fields
                 diffuse=glm.vec3,
                 opacity=float,
@@ -328,14 +328,14 @@ class SceneBuilder:
         scratch_buffers = [device.create_scratch_buffer(b) for b in to_build]
 
         with device.get_raytracing() as man:
-        #     # Transfer all buffers to gpu
-        #     man.cpu_to_gpu(instance_buffer)
-              man.cpu_to_gpu(s.vertices)
-        #     man.cpu_to_gpu(s.indices)
-        #     man.cpu_to_gpu(s.transforms)
-        #     man.cpu_to_gpu(s.material_buffer)
-        #     man.cpu_to_gpu(s.geometry_descriptions)
-        #     man.cpu_to_gpu(s.instance_descriptions)
+            # Transfer all buffers to gpu
+            man.cpu_to_gpu(instance_buffer)
+            man.cpu_to_gpu(s.vertices)
+            man.cpu_to_gpu(s.indices)
+            man.cpu_to_gpu(s.transforms)
+            man.cpu_to_gpu(s.material_buffer)
+            man.cpu_to_gpu(s.geometry_descriptions)
+            man.cpu_to_gpu(s.instance_descriptions)
 
         # BUILD all ADSs
         for i, ads in enumerate(to_build):

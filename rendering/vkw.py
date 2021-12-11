@@ -1926,7 +1926,7 @@ class DeviceWrapper:
         self.vkGetAccelerationStructureBuildSizesKHR(self.vk_device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
                                                      info, [range.primitiveCount for range in ranges], sizes)
         # Create a buffer to store the ads
-        ads_buffer = self.create_buffer(sizes.accelerationStructureSize,
+        ads_buffer = self.create_buffer(sizes.accelerationStructureSize * 2,
                            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
         # Create object
@@ -1937,11 +1937,9 @@ class DeviceWrapper:
         )
         ads = self.vkCreateAccelerationStructureKHR(self.vk_device, create_info, None)
         ads_buffer.resource_data.bind_ads(ads)
-
         query_device_address_info = VkAccelerationStructureDeviceAddressInfoKHR(accelerationStructure=ads)
         device_address = self.vkGetAccelerationStructureDeviceAddress(self.vk_device, query_device_address_info)
-
-        return ads_buffer, info, ranges, device_address, max(sizes.buildScratchSize, sizes.updateScratchSize)
+        return ads_buffer, info, ranges, device_address, max(sizes.buildScratchSize, sizes.updateScratchSize)*2
 
     def create_image(self, image_type, image_format, flags, extent, mips, layers, linear,
                      initial_layout, usage, properties):
