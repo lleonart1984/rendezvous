@@ -2,6 +2,7 @@ from rendering.manager import *
 import glm
 from typing import *
 from pywavefront import Wavefront
+from PIL import Image
 
 
 class RaytracingScene:
@@ -62,6 +63,7 @@ class RaytracingScene:
         gives the start offset of the first geometry in geometry descriptions and the material index
         """
         return self.instance_descriptions
+
 
 class SceneBuilder:
 
@@ -130,7 +132,7 @@ class SceneBuilder:
         max_comp = max(0.000001, max_p.x - min_p.x, max_p.y - min_p.y, max_p.z - min_p.z)
         scale = 1.0 / max_comp
         for i in range(len(v)//vertex_size):
-            self.positions[i] = (self.positions[i] - (min_p + max_p)*0.5)*scale
+            self.positions[i+vertex_offset] = (self.positions[i+vertex_offset] - (min_p + max_p)*0.5)*scale
         indices = list(range(len(v)//vertex_size))
         index_offset = self.add_indices(indices, vertex_offset)
         return self.add_geometry(index_offset, len(indices))
@@ -139,6 +141,7 @@ class SceneBuilder:
         index = len(self.textures)
         self.textures.append((name, data))
         self.textures_index[name] = index
+        return index
 
     def get_texture_index(self, name):
         return self.textures_index[name]
@@ -192,6 +195,23 @@ class SceneBuilder:
         )
         self.geometries_in_instances += len(geometries)
         return len(self.instances)-1
+
+    def _load_texture(self, path: str, data = None):
+        image = Image.open(path)
+        width, height = image.size
+        image = image.convert("RGBA")
+        data = image.getdata()
+        texture = self.device.create_texure_2D(Format.UINT_RGBA_STD, width, height, 1, 1)
+        bytes = bytearray()
+        for r,g,b,a in data:
+            bytes.append(r)
+            bytes.append(g)
+            bytes.append(b)
+            bytes.append(a)
+        texture.write(bytes)
+        with self.device.get_copy() as man:
+            man.cpu_to_gpu(texture)
+        return texture
 
     def build_raytracing_scene(self):
         s: RaytracingScene = RaytracingScene(RaytracingScene._get_validation_toke())
@@ -266,6 +286,8 @@ class SceneBuilder:
                     , mat.diff_map, mat.spec_map, mat.bump_map, mat.mask_map\
                     , mat.model = self.materials[i]
 
+        s.textures = [self._load_texture(p, data) for p, data in self.textures]
+
         to_build = []
         cached_geometry_groups = dict()
         # create geometry_descriptions and instance_decriptions
@@ -279,6 +301,7 @@ class SceneBuilder:
                 count=self.geometries_in_instances,
                 usage=BufferUsage.TRANSFER_DST | BufferUsage.STORAGE,
                 memory=MemoryProperty.GPU,
+                # Fields
                 start_vertex=int,
                 start_index=int,
                 transform_index=int
@@ -287,6 +310,7 @@ class SceneBuilder:
                 count=len(self.instances),
                 usage=BufferUsage.TRANSFER_DST | BufferUsage.STORAGE,
                 memory=MemoryProperty.GPU,
+                # Fields
                 start_geometry=int,
                 material_index=int
             )
@@ -298,7 +322,7 @@ class SceneBuilder:
                         index_start, index_count, transform_index = self.geometries[geom_index]
                         geometry_collection.append(
                             s.vertices,
-                            None, # s.indices.slice(index_start * 4, index_count * 4),
+                            s.indices.slice(index_start * 4, index_count * 4),
                             None if transform_index == -1 else s.transforms.slice(transform_index*48, 48)
                         )
                     geometry_ads = device.create_geometry_ads(geometry_collection)
@@ -343,3 +367,24 @@ class SceneBuilder:
                 man.build_ads(ads, scratch_buffers[i])
 
         return s
+
+
+class Camera:
+    def __init__(self):
+        self.position = glm.vec3(0,0,-2)
+        self.target = glm.vec3(0,0,0)
+        self.up = glm.vec3(0,1,0)
+        self.fov = glm.pi()/4
+        self.near_plane = 0.001
+        self.far_plane = 1000
+
+    def build_matrices(self, width, height):
+        return glm.lookAt(self.position, self.target, self.up), glm.perspective(self.fov, height/width, self.near_plane, self.far_plane)
+
+    def LookAt(self, target: glm.vec3):
+        self.target = target
+        return self
+
+    def PositionAt(self, position: glm.vec3):
+        self.position = position
+        return self

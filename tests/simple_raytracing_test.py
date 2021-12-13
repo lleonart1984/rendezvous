@@ -2,52 +2,91 @@ from rendering.manager import *
 from rendering.scenes import *
 from glm import *
 import matplotlib.pyplot as plt
+import time
+from techniques.pathtracer import Pathtracer
 
+compile_shader_sources('./shaders/PT')
 
-compile_shader_sources('./shaders')
+image_width = 1024
+image_height = 1024
 
-image_width = 512
-image_height = 512
+def app_loop():
 
-def render():
+    presenter = create_presenter(image_width, image_height, Format.UINT_BGRA_STD, PresenterMode.SDL,
+                                 usage=ImageUsage.RENDER_TARGET | ImageUsage.TRANSFER_DST,
+                                 debug=False)
 
-    presenter = create_presenter(width=image_width, height=image_height, format=Format.VEC4, mode=PresenterMode.OFFLINE,
-                                 usage=ImageUsage.STORAGE | ImageUsage.TRANSFER_SRC | ImageUsage.TRANSFER_DST,
-                                 debug=True)
+    # presenter = create_presenter(width=image_width, height=image_height, format=Format.VEC4, mode=PresenterMode.OFFLINE,
+    #                              usage=ImageUsage.STORAGE | ImageUsage.TRANSFER_SRC | ImageUsage.TRANSFER_DST,
+    #                              debug=True)
+
+    offline_image = presenter.create_image(ImageType.TEXTURE_2D, False, Format.UINT_BGRA_UNORM,
+                                           presenter.width, presenter.height, 1, 1, 1,
+                                           ImageUsage.STORAGE | ImageUsage.TRANSFER_SRC, MemoryProperty.GPU)
 
     scene_builder = SceneBuilder(device=presenter)
-    geometry1 = scene_builder.add_geometry_obj("./models/pitagoras.obj")
-    scene_builder.add_instance([geometry1], transform=glm.scale(glm.vec3(1.5, 1.5, -1.5)))
+
+    wood = scene_builder.add_texture("./models/wood.jpg")
+    plate_mat = scene_builder.add_material(
+        diffuse=vec3(1, 1, 1),
+        diffuse_map=wood
+    )
+    diffuse_mat = scene_builder.add_material(
+    )
+    specular_mat = scene_builder.add_material(
+        illumination_model_mix=vec4(0,1,0,0)
+    )
+    mirror_mat = scene_builder.add_material(
+        illumination_model_mix=vec4(0,0,1,0)
+    )
+    fresnel_mat = scene_builder.add_material(
+        refraction_index=0.9,
+        illumination_model_mix=vec4(0,0,0,1),
+    )
+    plate = scene_builder.add_geometry_obj("./models/plate.obj")
+    bunny = scene_builder.add_geometry_obj("./models/bunnyScene.obj")
+    scene_builder.add_instance([plate], material_index=plate_mat, transform=glm.scale(glm.vec3(4.5, 1, 4.5)))
+    scene_builder.add_instance([bunny], material_index=diffuse_mat, transform=glm.translate(glm.vec3(-0.5, 0.5, 0.5)))
+    scene_builder.add_instance([bunny], material_index=specular_mat, transform=glm.translate(glm.vec3(-0.5, 0.5, -0.5)))
+    scene_builder.add_instance([bunny], material_index=mirror_mat, transform=glm.translate(glm.vec3(0.5, 0.5, -0.5)))
+    scene_builder.add_instance([bunny], material_index=fresnel_mat, transform=glm.translate(glm.vec3(0.5, 0.5, 0.5)))
     raytracing_scene = scene_builder.build_raytracing_scene()
 
-    pipeline = presenter.create_raytracing_pipeline()
-    raygen = pipeline.load_rt_generation_shader('./shaders/test_basic_raygen.rgen.spv')
-    raymiss = pipeline.load_rt_miss_shader('./shaders/test_raymiss.rmiss.spv')
-    raymiss2 = pipeline.load_rt_miss_shader('./shaders/test_raymiss2.rmiss.spv')
-    rayhit = pipeline.load_rt_closest_hit_shader('./shaders/test_rayhit.rchit.spv')
-    gen_group = pipeline.create_rt_gen_group(raygen)
-    miss_group = pipeline.create_rt_miss_group(raymiss)
-    miss2_group = pipeline.create_rt_miss_group(raymiss2)
-    hit_group = pipeline.create_rt_hit_group(rayhit)
-    pipeline.bind_scene_ads(0, ShaderStage.RT_GENERATION | ShaderStage.RT_CLOSEST_HIT, lambda: raytracing_scene.scene_ads)
-    pipeline.bind_storage_image(1, ShaderStage.RT_GENERATION, lambda: presenter.render_target())
-    pipeline.close()
+    camera = Camera()
+    camera.PositionAt(vec3(2,1.8,3)).LookAt(vec3(0,0.4,0))
 
-    program = pipeline.create_rt_program(2, 1)
-    program.set_generation(gen_group)
-    program.set_hit_group(0, hit_group)
-    program.set_miss(1, miss_group)
-    program.set_miss(0, miss2_group)
+    technique = Pathtracer(raytracing_scene, offline_image, './shaders/PT')
+    presenter.load_technique(technique)
 
-    with presenter.get_raytracing() as man:
-        man.set_pipeline(pipeline)
-        man.dispatch_rays(program, presenter.width, presenter.height)
+    technique.update_camera(camera)
 
-    with presenter.get_raytracing() as man:
-        man.gpu_to_cpu(presenter.render_target())
+    window = presenter.get_window()
 
-    plt.imshow(presenter.render_target().as_numpy())
+    last_time = time.perf_counter()
+    fps = 0
+    while True:
+        fps += 1
+        current_time = time.perf_counter()
+        if current_time - last_time >= 1:
+            last_time = current_time
+            print("FPS: %s" % fps)
+            fps = 0
+
+        event, args = window.poll_events()
+        if event == Event.CLOSED:
+            break
+
+        # camera.PositionAt(glm.rotateY(glm.vec3(1,1,-2), current_time))
+
+        with presenter:
+            presenter.dispatch_technique(technique)
+
+    with presenter.get_compute() as man:
+        man.gpu_to_cpu(offline_image)
+        
+    plt.imshow(offline_image.as_numpy()[:,:,(2,1,0)])
     plt.show()
 
 
-render()
+app_loop()
+

@@ -22,7 +22,7 @@ def compile_shader_sources(directory='.'):
             binary_file = filename_without_extension + ".spv"
             if needs_to_update(filename, binary_file):
                 p = subprocess.Popen(
-                    os.path.expandvars('%VULKAN_SDK%/Bin/glslangValidator.exe -V --target-env vulkan1.2 ').replace("\\","/")
+                    os.path.expandvars('%VULKAN_SDK%/Bin/glslangValidator.exe -r -V --target-env vulkan1.2 ').replace("\\","/")
                     + f'-S {stage} {filename} -o {binary_file}'
                 )
                 p.wait()
@@ -79,6 +79,7 @@ class ImageUsage(IntFlag):
 
 class Format(IntEnum):
     UINT_RGBA = VK_FORMAT_R8G8B8A8_UINT
+    UINT_RGB = VK_FORMAT_R8G8B8_UINT
     UINT_BGRA_STD = VK_FORMAT_B8G8R8A8_SRGB
     UINT_RGBA_STD = VK_FORMAT_R8G8B8A8_SRGB
     UINT_BGRA_UNORM = VK_FORMAT_B8G8R8A8_UNORM
@@ -133,13 +134,6 @@ class ShaderStage(IntEnum):
     RT_MISS = VK_SHADER_STAGE_MISS_BIT_KHR
     RT_ANY_HIT = VK_SHADER_STAGE_ANY_HIT_BIT_KHR
     RT_INTERSECTION_HIT = VK_SHADER_STAGE_INTERSECTION_BIT_KHR
-
-
-class UpdateLevel(IntEnum):
-    PIPELINE = 0
-    RENDER_PASS = 1
-    PER_MATERIAL = 2
-    PER_OBJECT = 3
 
 
 class Filter(IntEnum):
@@ -592,8 +586,8 @@ class Pipeline:
     def close(self):
         self.w_pipeline._build_objects()
 
-    def set_update_level(self, level: UpdateLevel):
-        self.w_pipeline.descriptor_set(level)
+    def descriptor_set(self, set_slot: int):
+        self.w_pipeline.descriptor_set(set_slot)
 
     def _bind_resource(self, slot: int, stage: ShaderStage, count: int, resolver, vk_descriptor_type):
         self.w_pipeline.binding(
@@ -636,6 +630,13 @@ class Pipeline:
 
     def bind_scene_ads(self, slot: int, stage: ShaderStage, resolver):
         self._bind_resource(slot, stage, 1, lambda: [resolver()], VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR)
+
+    def bind_constants(self, offset: int, stage: ShaderStage, **fields):
+        layout, size = Uniform.process_layout(fields)
+        for field_name, (field_offset, field_size, field_type) in layout.items():
+            self.w_pipeline.add_constant_range(
+                stage, field_name, offset+field_offset, field_size, field_type
+            )
 
     def load_shader(self, stage: ShaderStage, path, main_function = 'main'):
         return self.w_pipeline.load_shader(vkw.ShaderStageWrapper.from_file(
@@ -746,16 +747,14 @@ class ComputeManager(CopyManager):
         if not pipeline.is_closed():
             raise Exception("Error, can not set a pipeline has not been closed.")
         self.w_cmdList.set_pipeline(pipeline=pipeline.w_pipeline)
-        self.w_cmdList.update_bindings_level(0)  # after set the pipeline
 
-    def set_render_pass(self):
-        self.w_cmdList.update_bindings_level(1)
+    def update_sets(self, *sets):
+        for s in sets:
+            self.w_cmdList.update_bindings_level(s)
 
-    def set_material(self):
-        self.w_cmdList.update_bindings_level(2)
-
-    def set_object(self):
-        self.w_cmdList.update_bindings_level(3)
+    def update_constants(self, **fields):
+        for k, v in fields.items():
+            self.w_cmdList.update_constant(k, BinaryFormatter.to_bytes(type=type(v), value=v))
 
     def dispatch_groups(self, groups_x: int, groups_y: int = 1, groups_z:int = 1):
         self.w_cmdList.dispatch_groups(groups_x, groups_y, groups_z)
@@ -1067,6 +1066,9 @@ def create_presenter(width: int, height: int,
 
 
 class Technique(DeviceManager):
+    def __setup__(self):
+        pass
+
     def __dispatch__(self):
         pass
 

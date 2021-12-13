@@ -7,13 +7,14 @@ CommandBuffer (represents a command list to be populated)
 GPUTask (synchronization object to wait for GPU completation)
 """
 from typing import Dict
+
 from vulkan import *
 import ctypes
 from enum import Enum
 import numpy as np
 
 
-__TRACE__ = True
+__TRACE__ = False
 
 def trace_destroying(function):
     def wrapper(self, *args):
@@ -23,6 +24,7 @@ def trace_destroying(function):
         if __TRACE__:
             print("done.")
     return wrapper
+
 
 class ResourceState:
     def __init__(self, vk_access, vk_stage, vk_layout, queue_index):
@@ -71,6 +73,7 @@ _FORMAT_DESCRIPTION = {
     VK_FORMAT_B8G8R8A8_SINT: (4, 'b'),
     VK_FORMAT_B8G8R8A8_SRGB: (4, 'b'),
 }
+
 
 _FORMAT_SIZES = {
 
@@ -658,8 +661,12 @@ class ResourceWrapper:
 
 
 class SamplerWrapper:
-    def __init__(self, vk_sampler):
+    def __init__(self, w_device, vk_sampler):
+        self.w_device = w_device
         self.vk_sampler = vk_sampler
+
+    def __del__(self):
+        vkDestroySampler(self.w_device.vk_device, self.vk_sampler, None)
 
 
 class ShaderHandlerWrapper:
@@ -678,9 +685,10 @@ class PipelineBindingWrapper:
         self.w_device = w_device
         self.pipeline_type = pipeline_type
         self.descriptor_sets_description = [[], [], [], []]
-        self.active_level = 0
+        self.active_set = 0
         self.active_descriptor_set = self.descriptor_sets_description[0]  # by default activate global set
         self.shaders = {}
+        self.push_constants = { }
         self.rt_shaders = []  # shader stages
         self.rt_groups = []  # groups for hits
         self.rt_group_handles = []  # handles computed for each group
@@ -712,7 +720,7 @@ class PipelineBindingWrapper:
         if self.pipeline_object:
             vkDestroyPipeline(self.w_device.vk_device, self.pipeline_object, None)
         self.descriptor_sets_description = [[], [], [], []]
-        self.active_level = 0
+        self.active_set = 0
         self.active_descriptor_set = None
         self.shaders = {}
         self.descriptor_set_layouts = []
@@ -723,16 +731,19 @@ class PipelineBindingWrapper:
         self.current_cmdList = None
         self.w_device = None
 
-    def descriptor_set(self, level):
+    def descriptor_set(self, set_slot):
         assert not self.initialized, "Error, can not continue pipeline setup after initialized"
-        self.active_level = level
-        self.active_descriptor_set = self.descriptor_sets_description[level]
+        self.active_set = set_slot
+        self.active_descriptor_set = self.descriptor_sets_description[set_slot]
 
     def binding(self, slot, vk_stage, vk_descriptor_type, count, resolver):
         assert not self.initialized, "Error, can not continue pipeline setup after initialized"
         self.active_descriptor_set.append(
             (slot, vk_stage, vk_descriptor_type, count, resolver)
         )
+
+    def add_constant_range(self, stage, field_name, offset, field_size, field_type):
+        self.push_constants[field_name] = (offset, stage, field_size, field_type, bytearray(field_size))
 
     def load_shader(self, w_shader) -> int:
         assert not self.initialized, "Error, can not continue pipeline setup after initialized"
@@ -741,7 +752,7 @@ class PipelineBindingWrapper:
             return len(self.rt_shaders)-1
         else:
             self.shaders[w_shader.vk_stage_info.stage] = w_shader
-            return None
+            return 0
 
     def create_hit_group(self,
                          closest_hit_index: int = None,
@@ -781,6 +792,7 @@ class PipelineBindingWrapper:
         assert not self.initialized, "Error, can not continue pipeline setup after initialized"
         # Builds the descriptor sets layouts
         descriptor_set_layout_bindings = [[], [], [], []]
+        descriptor_set_layout_bindings_bound = [[],[],[],[]]
         counting_by_type = {
             VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE: 1,
             VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: 1,
@@ -789,34 +801,72 @@ class PipelineBindingWrapper:
             VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER: 1,
             VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR: 1,
         }
+        var_count_info = []
         for level in range(4):
+            has_variable_descriptor = False
             for slot, vk_stage, vk_descriptor_type, count, resolver in self.descriptor_sets_description[level]:
-                lb = VkDescriptorSetLayoutBinding(slot, vk_descriptor_type, count, vk_stage)
+                effect_count = 100 if count == -1 else count
+                lb = VkDescriptorSetLayoutBinding(
+                    slot,
+                    vk_descriptor_type,
+                    effect_count, # for unbound descriptor set array
+                    vk_stage
+                )
+                # bound = VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT | VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT \
+                bound = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT \
+                    if count == -1 else \
+                    0
+                if count == -1:
+                    has_variable_descriptor = True
                 descriptor_set_layout_bindings[level].append(lb)
-                counting_by_type[vk_descriptor_type] += count * self.w_device.get_number_of_frames()
+                descriptor_set_layout_bindings_bound[level].append(bound)
+                counting_by_type[vk_descriptor_type] += effect_count * self.w_device.get_number_of_frames()
+            var_count_info.append(0 if not has_variable_descriptor else 100)
         self.descriptor_pool = vkCreateDescriptorPool(self.w_device.vk_device, VkDescriptorPoolCreateInfo(
             maxSets=4 * self.w_device.get_number_of_frames(),
             poolSizeCount=6,
             pPoolSizes=[VkDescriptorPoolSize(t, c) for t, c in counting_by_type.items()]
         ), pAllocator=None)
 
-        self.descriptor_set_layouts = [vkCreateDescriptorSetLayout(self.w_device.vk_device,
-                                           VkDescriptorSetLayoutCreateInfo(
-                                               bindingCount=len(lb),
-                                               pBindings=lb
-                                           ), None) for lb in descriptor_set_layout_bindings]
+        self.descriptor_set_layouts = []
+        for level, lb in enumerate(descriptor_set_layout_bindings):
+            bound_info = VkDescriptorSetLayoutBindingFlagsCreateInfo(
+                pBindingFlags=descriptor_set_layout_bindings_bound[level],
+                bindingCount=len(descriptor_set_layout_bindings_bound[level])
+            )
+            dslci = VkDescriptorSetLayoutCreateInfo(
+                pNext = bound_info,
+                bindingCount=len(lb),
+                pBindings=lb
+            )
+            self.descriptor_set_layouts.append(
+                vkCreateDescriptorSetLayout(self.w_device.vk_device,
+                                        dslci, None))
 
         # Builds the descriptor sets (one group for each frame)
         descriptor_set_layouts_per_frame = self.descriptor_set_layouts * self.w_device.get_number_of_frames()
+        var_count_info = var_count_info * self.w_device.get_number_of_frames()
+        var_count = VkDescriptorSetVariableDescriptorCountAllocateInfo(
+            descriptorSetCount=0, # len(var_count_info),
+            pDescriptorCounts=var_count_info,
+        )
         allocate_info = VkDescriptorSetAllocateInfo(
+            pNext = var_count,
             descriptorPool=self.descriptor_pool,
             descriptorSetCount=len(descriptor_set_layouts_per_frame),
             pSetLayouts=descriptor_set_layouts_per_frame)
         self.descriptor_sets = vkAllocateDescriptorSets(self.w_device.vk_device, allocate_info)
         # Builds pipeline object
+        push_constant_ranges = [VkPushConstantRange(
+            size=size,
+            offset=offset,
+            stageFlags=stage
+        ) for k, (offset, stage, size, type, data) in self.push_constants.items()]
         pipeline_layout_info = VkPipelineLayoutCreateInfo(
             setLayoutCount=4,
-            pSetLayouts=self.descriptor_set_layouts
+            pSetLayouts=self.descriptor_set_layouts,
+            pushConstantRangeCount=len(push_constant_ranges),
+            pPushConstantRanges=push_constant_ranges
         )
         self.pipeline_layout = vkCreatePipelineLayout(self.w_device.vk_device, pipeline_layout_info, None)
         if self.pipeline_type == VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO:
@@ -857,11 +907,29 @@ class PipelineBindingWrapper:
         self.initialized = True
 
     def _set_at_cmdList(self, vk_cmdList, queue_index):
+        frame = self.w_device.get_frame_index()
         self.current_cmdList = vk_cmdList
         self.current_queue_index = queue_index
         vkCmdBindPipeline(vk_cmdList, self.point, self.pipeline_object)
+        vkCmdBindDescriptorSets(
+            commandBuffer=self.current_cmdList,
+            pipelineBindPoint=self.point,
+            layout=self.pipeline_layout,
+            firstSet=0,
+            descriptorSetCount=4,
+            pDescriptorSets=self.descriptor_sets[frame * 4: frame * 4 + 4],
+            dynamicOffsetCount=0,
+            pDynamicOffsets=None
+        )
 
     def _solve_resolver_as_buffers(self, buffer: ResourceWrapper, vk_descriptor_type):
+        if buffer is None:
+            # NULL DESCRIPTOR
+            return VkDescriptorBufferInfo(
+                buffer=None,
+                offset=0,
+                range=UINT64_MAX
+            )
         if vk_descriptor_type == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
             return None
         else:
@@ -928,15 +996,18 @@ class PipelineBindingWrapper:
                     accelerationStructureCount=1,
                     pAccelerationStructures=[resolver()[0].w_resource.resource_data.ads]
                 )
+            if is_buffer:
+                descriptors = [self._solve_resolver_as_buffers(b.w_resource if b else None, vk_descriptor_type) for b in resolver()]
+            else:
+                descriptors = [self._solve_resolver_as_image(t, vk_descriptor_type, vk_stage) for t in resolver()]
             dw = VkWriteDescriptorSet(
                 pNext=next,
                 dstSet=self.descriptor_sets[frame*4 + level],
                 dstBinding=slot,
                 descriptorType=vk_descriptor_type,
-                descriptorCount=count,
-                pBufferInfo=[self._solve_resolver_as_buffers(b.w_resource, vk_descriptor_type) for b in resolver()] if is_buffer and next is None else None,
-                pImageInfo=[self._solve_resolver_as_image(t, vk_descriptor_type, vk_stage)
-                            for t in resolver()] if not is_buffer else None
+                descriptorCount=len(descriptors),
+                pBufferInfo= descriptors if is_buffer and not next else None,
+                pImageInfo= descriptors if not is_buffer else None
             )
             descriptorWrites.append(dw)
         vkUpdateDescriptorSets(
@@ -946,16 +1017,7 @@ class PipelineBindingWrapper:
             descriptorCopyCount=0,
             pDescriptorCopies=None
         )
-        vkCmdBindDescriptorSets(
-            commandBuffer=self.current_cmdList,
-            pipelineBindPoint=self.point,
-            layout=self.pipeline_layout,
-            firstSet=frame*4 + level,
-            descriptorSetCount=1,
-            pDescriptorSets=self.descriptor_sets,
-            dynamicOffsetCount=0,
-            pDynamicOffsets=None
-        )
+
 
 
 class CommandListState(Enum):
@@ -1080,6 +1142,15 @@ class CommandBufferWrapper:
     def set_pipeline(self, pipeline: PipelineBindingWrapper):
         self.current_pipeline = pipeline
         pipeline._set_at_cmdList(self.vk_cmdList, self.pool.queue_index)
+
+    def update_constant(self, field_name, field_data):
+        offset, stage, size, type, data = self.current_pipeline.push_constants[field_name]
+        data[0:size] = field_data
+        vkCmdPushConstants(
+            self.vk_cmdList,
+            self.current_pipeline.pipeline_layout,
+            stage, offset, size, ffi.from_buffer(data)
+        )
 
     def update_bindings_level(self, level):
         self.current_pipeline._update_level(level)
@@ -1498,7 +1569,12 @@ class DeviceWrapper:
 
         dev_features = self.__physical_devices_features[self.__physical_device]
 
+        rob_features = VkPhysicalDeviceRobustness2FeaturesEXT(
+            nullDescriptor=True,
+        )
+
         ads_features = VkPhysicalDeviceAccelerationStructureFeaturesKHR(
+            pNext = rob_features,
             accelerationStructure=True,
             # accelerationStructureHostCommands=True,
             # descriptorBindingAccelerationStructureUpdateAfterBind=True,
@@ -1512,6 +1588,11 @@ class DeviceWrapper:
         features = VkPhysicalDeviceVulkan12Features(
             pNext=rt_features,
             bufferDeviceAddress=True,
+            scalarBlockLayout=True,
+            shaderSampledImageArrayNonUniformIndexing=True,
+            runtimeDescriptorArray=True,
+            descriptorBindingVariableDescriptorCount=True,
+            descriptorBindingPartiallyBound=True,
         )
 
         device_create = VkDeviceCreateInfo(
@@ -1987,7 +2068,7 @@ class DeviceWrapper:
             borderColor=border_color,
             unnormalizedCoordinates=use_unnormalized_coordinates
         )
-        return SamplerWrapper(vkCreateSampler(self.vk_device, info, None))
+        return SamplerWrapper(self, vkCreateSampler(self.vk_device, info, None))
 
     def create_pipeline(self, vk_pipeline_type):
         return PipelineBindingWrapper(w_device=self, pipeline_type=vk_pipeline_type)
