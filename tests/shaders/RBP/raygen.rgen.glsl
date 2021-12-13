@@ -7,9 +7,8 @@
 #include "../Common/PTEnvironment.h"
 
 layout(set = 0, binding = 0) uniform accelerationStructureEXT Scene;
-layout(set = 0, binding = 1, rgba8) uniform image2D OutputImage;
-layout(set = 0, binding = 2, rgba32f) uniform image2D Accumulation;
-layout(set = 0, binding = 3) uniform CameraTransforms {
+layout(set = 0, binding = 1, rgba32f) uniform image2D dL;
+layout(set = 0, binding = 2) uniform CameraTransforms {
     mat4 ProjToWorld;
 } camera;
 layout( push_constant ) uniform constants

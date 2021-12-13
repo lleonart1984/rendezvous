@@ -4,8 +4,9 @@
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_nonuniform_qualifier : require
 
-#include "PTCommon.h"
-#include "Randoms.h"
+#include "../Common/PTCommon.h"
+#include "../Common/Randoms.h"
+#include "../Common/SurfaceScattering.h"
 
 /*
 Logic for scattering of light and surface.
@@ -21,15 +22,6 @@ layout(set=1, binding = 6) uniform sampler2D textures[100];
 
 layout(location = 0) rayPayloadInEXT RayHitPayload Payload;
 hitAttributeEXT vec2 HitAttribs;
-
-float ComputeFresnel(float NdotL, float ratio)
-{
-	float oneMinusRatio = 1 - ratio;
-	float onePlusRatio = 1 + ratio;
-	float divOneMinusByOnePlus = oneMinusRatio / onePlusRatio;
-	float f = divOneMinusByOnePlus * divOneMinusByOnePlus;
-	return (f + (1.0 - f) * pow((1.0 - NdotL), 5));
-}
 
 void main() {
     InstanceDesc instance = instances.data[gl_InstanceID];
@@ -82,62 +74,8 @@ void main() {
     }
 
     vec3 V = -Payload.Direction;
-    float VdotN = dot(V, N);
-    bool entering = VdotN > 0;
-    VdotN = entering ? VdotN : -VdotN;
-    vec3 fN = entering ? N : -N;
-    Payload.Position = P + fN*0.0001;
 
-    // Compute scattering
-    float xi = random(Payload.rng_seed);
-    if (xi < material.Model.x)// Diffuse
-    {
-        float NdotL;
-        Payload.Direction = randomHSDirectionCosineWeighted(Payload.rng_seed, N, NdotL);
-        Payload.BRDF_cos = material.Diffuse;
-        Payload.PDF = 1;
-        return;
-    }
-    xi -= material.Model.x;
-    if (xi < material.Model.y)// Glossy
-    {
-        float NdotL;
-        Payload.Direction = randomHSDirectionCosineWeighted(Payload.rng_seed, N, NdotL);
-        vec3 H = normalize(V + Payload.Direction);
-        Payload.BRDF_cos = material.Specular * pow(max(0, dot(H, N)), material.SpecularPower)
-        * (2 + material.SpecularPower) / (2*pi);// normalizing blinn model
-        Payload.PDF = NdotL;
-        return;
-    }
-    xi -= material.Model.y;
-
-    if (xi < material.Model.z)// mirror
-    {
-        Payload.Direction = reflect(-V, N);
-        Payload.BRDF_cos = material.Specular;
-        Payload.PDF = 1;
-        return;
-    }
-    xi -= material.Model.z;
-
-    // Fresnel TODO
-
-    float eta = entering ? material.RefractionIndex : 1 / material.RefractionIndex;
-    float F = ComputeFresnel(VdotN, eta);
-    vec3 T = refract (-V, fN, eta);
-    if (all(equal(T, vec3(0))))// total internal reflection
-    F = 1;
-    if (xi < material.Model.w*F) // reflection
-    {
-        Payload.Direction = reflect(-V, fN);
-        Payload.BRDF_cos = material.Specular;
-        Payload.PDF = 1;
-    }
-    else
-    {
-        Payload.Direction = T;
-        Payload.BRDF_cos = material.Specular;
-        Payload.PDF = 1;
-        Payload.Position = P - fN*0.0001; // traspass surface
-    }
+    Payload.Position = P;
+    SurfaceScatter(Payload.rng_seed, Payload.Position, V, N, material,
+    Payload.Direction, Payload.BRDF_cos, Payload.PDF);
 }

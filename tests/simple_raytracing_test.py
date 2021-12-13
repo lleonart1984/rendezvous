@@ -27,11 +27,13 @@ def app_loop():
     scene_builder = SceneBuilder(device=presenter)
 
     wood = scene_builder.add_texture("./models/wood.jpg")
+    wood2 = scene_builder.add_texture("./models/wood.jpg")
     plate_mat = scene_builder.add_material(
         diffuse=vec3(1, 1, 1),
         diffuse_map=wood
     )
     diffuse_mat = scene_builder.add_material(
+        diffuse_map=wood2
     )
     specular_mat = scene_builder.add_material(
         illumination_model_mix=vec4(0,1,0,0)

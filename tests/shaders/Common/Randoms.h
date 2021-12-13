@@ -47,6 +47,20 @@ vec3 randomDirection(inout uvec4 rng_state, vec3 D) {
 	return t0 * x + t1 * y + D * z;
 }
 
+vec3 randomHSDirection(inout uvec4 rng_state, vec3 D) {
+	float r1 = random(rng_state);
+	float r2 = random(rng_state);
+	float sqrR2 = r2 * r2;
+	float two_pi_by_r1 = two_pi * r1;
+	float sqrt_of_one_minus_sqrR2 = sqrt(1.0 - sqrR2);
+	float x = cos(two_pi_by_r1) * sqrt_of_one_minus_sqrR2;
+	float y = sin(two_pi_by_r1) * sqrt_of_one_minus_sqrR2;
+	float z = r2;
+	vec3 t0, t1;
+	createOrthoBasis(D, t0, t1);
+	return t0 * x + t1 * y + D * z;
+}
+
 vec3 randomHSDirectionCosineWeighted(inout uvec4 rng_state, vec3 N, out float NdotD)
 {
 	vec3 t0, t1;

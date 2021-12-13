@@ -1,6 +1,6 @@
 
 const vec3 LightDirection = normalize(vec3(1,4,-1));
-const vec3 LightIntensity = vec3(1,1,1) * 3.14;
+const vec3 LightIntensity = vec3(1,1,1) * 3.14 * 2;
 
 vec3 SampleSkybox(vec3 dir){
     vec3 L = dir;

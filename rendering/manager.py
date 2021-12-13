@@ -861,13 +861,6 @@ class DeviceManager:
             memory=MemoryProperty.DYNAMIC
         )
 
-    def create_buffer_storage(self, size):
-        return self.create_buffer(
-            size=size,
-            usage=BufferUsage.STORAGE,
-            memory=MemoryProperty.GPU
-        )
-
     def create_buffer_staging(self, size):
         return self.create_buffer(
             size=size,
