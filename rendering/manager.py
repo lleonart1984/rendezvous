@@ -8,6 +8,8 @@ import numpy as np
 from typing import List, Dict, Tuple
 import glm
 import struct
+import torch
+
 
 def compile_shader_sources(directory='.'):
     import os
@@ -260,8 +262,19 @@ class Buffer(Resource):
     def write(self, data):
         self.w_resource.write(data)
 
+    def write_direct(self, device, data):
+        self.write(data)
+        with device.get_copy() as man:
+            man.cpu_to_gpu(self)
+
     def read(self, data):
         self.w_resource.read(data)
+
+    def read_direct(self, device, data):
+        with device.get_copy() as man:
+            man.gpu_to_cpu(self)
+        self.read(data)
+
 
     def structured(self, **fields):
         layout, size = Uniform.process_layout(fields)
@@ -269,6 +282,12 @@ class Buffer(Resource):
 
     def as_indices(self):
         return IndexBuffer(self.w_resource)
+
+    def as_numpy(self, dtype: np.dtype = np.float32()):
+        return self.w_resource.as_numpy(dtype)
+
+    def as_torch(self, dtype: np.dtype = np.float32()):
+        return torch.Tensor(self.as_numpy(dtype))
 
 
 class Uniform(Buffer):

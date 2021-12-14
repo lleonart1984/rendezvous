@@ -12,7 +12,7 @@ from vulkan import *
 import ctypes
 from enum import Enum
 import numpy as np
-
+import torch
 
 __TRACE__ = False
 
@@ -498,6 +498,8 @@ class ResourceWrapper:
             bytes = np.array(bytes)
         if isinstance(bytes, np.ndarray):  # get buffer from numpy array
             bytes = bytes.data.cast('b')
+        if isinstance(bytes, torch.Tensor):
+            bytes = np.array(bytes).data.cast('b')
         if self.resource_data.is_buffer:
             offset = self.current_slice["offset"]
             size = self.current_slice["size"]

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from manager import *
+from rendering.manager import *
 
 class TrainableRenderer:
 
@@ -58,7 +58,13 @@ class TrainableRendererFunction(torch.autograd.Function):
         objects for use in the backward pass using the ctx.save_for_backward method.
         """
         ctx.save_for_backward(input, renderer)
-        return input.clamp(min=0)
+        renderer.v_parameters.write(input)
+        with renderer.device.get_copy() as man:
+            man.cpu_to_gpu(renderer.v_parameters)
+        renderer.forward_render()
+        with renderer.device.get_copy() as man:
+            man.gpu_to_cpu(renderer.v_output)
+        return renderer.v_output.as_torch()
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -67,13 +73,25 @@ class TrainableRendererFunction(torch.autograd.Function):
         with respect to the output, and we need to compute the gradient of the loss
         with respect to the input.
         """
+        renderer: TrainableRenderer
         input, renderer = ctx.saved_tensors
-        grad_input = grad_output.clone()
-        grad_input[input < 0] = 0
-        return grad_input
+        renderer.grad_output.write(grad_output)
+        renderer.v_parameters.write(input)
+        with renderer.device.get_copy() as man:
+            man.cpu_to_gpu(renderer.grad_output)
+            man.cpu_to_gpu(renderer.v_parameters)
+        renderer.backward_render()
+        with renderer.device.get_copy() as man:
+            man.gpu_to_cpu(renderer.grad_parameters)
+        return renderer.grad_parameters.as_torch()
 
 class RenderingModule(nn.Module):
-    pass
+    def __init__(self, trainable_renderer: TrainableRenderer):
+        super().__init__()
+        self.trainable_renderer = trainable_renderer
+
+    def forward(self, input: torch.Tensor):
+        return TrainableRendererFunction.apply(input, self.trainable_renderer)
 
 
 
