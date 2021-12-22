@@ -2,8 +2,8 @@ from rendering.manager import *
 from glm import *
 import time
 
-presenter = create_presenter(800, 600, Format.UINT_BGRA_STD, PresenterMode.SDL,
-                             usage=ImageUsage.RENDER_TARGET | ImageUsage.TRANSFER_DST, debug=False)
+presenter = create_presenter(800, 600, Format.UINT_BGRA_STD, PresenterMode.OFFLINE,
+                             usage=ImageUsage.RENDER_TARGET | ImageUsage.TRANSFER_DST | ImageUsage.TRANSFER_SRC, debug=False)
 
 window = presenter.get_window()
 
@@ -16,10 +16,14 @@ while True:
         print("FPS: %s" % fps)
         fps = 0
 
-    event, args = window.poll_events()
-    if event == Event.CLOSED:
-        break
+    # event, args = window.poll_events()
+    # if event == Event.CLOSED:
+    #    break
 
     with presenter as p:
         with p.get_graphics() as man:
             man.clear_color(p.render_target(), vec4(1,0.4,0.5,1))
+            man.gpu_to_cpu(p.render_target())
+
+    data = presenter.render_target().as_numpy()
+    exit()

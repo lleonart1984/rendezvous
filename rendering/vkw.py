@@ -275,13 +275,14 @@ class ResourceData:
         pass
 
     def invalidate_mapped(self):
-        # vkInvalidateMappedMemoryRanges(self.device.vk_device, 1, [
-        #     VkMappedMemoryRange(
-        #         memory=self._resolve_staging().vk_resource_memory,
-        #         offset=0,
-        #         size=UINT64_MAX
-        #     )
-        # ])
+        # if self.__permanent_map:
+        #     vkInvalidateMappedMemoryRanges(self.device.vk_device, 1, [
+        #         VkMappedMemoryRange(
+        #             memory=self.vk_resource_memory,
+        #             offset=0,
+        #             size=self.cpu_size
+        #         )
+        #     ])
         pass
 
     def unmap(self):
@@ -430,8 +431,9 @@ class ResourceWrapper:
         srcAccessMask, srcStageMask, oldLayout, srcQueue = self.resource_data.current_state
         dstAccessMask, dstStageMask, newLayout, dstQueue = state
 
-        if srcQueue == VK_QUEUE_FAMILY_IGNORED:
-            dstQueue = VK_QUEUE_FAMILY_IGNORED
+        # if srcQueue == VK_QUEUE_FAMILY_IGNORED:
+        srcQueue = VK_QUEUE_FAMILY_IGNORED
+        dstQueue = VK_QUEUE_FAMILY_IGNORED
 
         if self.resource_data.is_buffer:
             if not self.resource_data.is_ads:
@@ -459,7 +461,7 @@ class ResourceWrapper:
             )
             vkCmdPipelineBarrier(vk_cmdList, srcStageMask, dstStageMask, 0,
                                  0, None, 0, None, 1, barrier)
-        self.current_state = state
+        self.resource_data.current_state = state
 
     def as_readonly(self):
         new_slice = dict(self.current_slice)
@@ -648,6 +650,7 @@ class ResourceWrapper:
             queue_index=VK_QUEUE_FAMILY_IGNORED
         ))
         self.resource_data.transfer_slice_from_gpu(self.current_slice, vk_cmdList)
+        self.resource_data.invalidate_mapped()
 
     def add_transfer_to_gpu(self, vk_cmdList):
         self.add_barrier(vk_cmdList, state=ResourceState(
@@ -744,8 +747,9 @@ class PipelineBindingWrapper:
             (slot, vk_stage, vk_descriptor_type, count, resolver)
         )
 
-    def add_constant_range(self, stage, field_name, offset, field_size, field_type):
-        self.push_constants[field_name] = (offset, stage, field_size, field_type, bytearray(field_size))
+    def add_constant_range(self, stage, offset, size, layout):
+        assert stage not in self.push_constants, "Can not have more than one range of constants per stage"
+        self.push_constants[stage] = (offset, size, layout, bytearray(size))
 
     def load_shader(self, w_shader) -> int:
         assert not self.initialized, "Error, can not continue pipeline setup after initialized"
@@ -815,9 +819,9 @@ class PipelineBindingWrapper:
                     vk_stage
                 )
                 # bound = VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT | VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT \
-                bound = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT \
+                bound = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT\
                     if count == -1 else \
-                    0
+                    VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT
                 if count == -1:
                     has_variable_descriptor = True
                 descriptor_set_layout_bindings[level].append(lb)
@@ -827,7 +831,8 @@ class PipelineBindingWrapper:
         self.descriptor_pool = vkCreateDescriptorPool(self.w_device.vk_device, VkDescriptorPoolCreateInfo(
             maxSets=4 * self.w_device.get_number_of_frames(),
             poolSizeCount=6,
-            pPoolSizes=[VkDescriptorPoolSize(t, c) for t, c in counting_by_type.items()]
+            pPoolSizes=[VkDescriptorPoolSize(t, c) for t, c in counting_by_type.items()],
+            flags=VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT
         ), pAllocator=None)
 
         self.descriptor_set_layouts = []
@@ -839,7 +844,8 @@ class PipelineBindingWrapper:
             dslci = VkDescriptorSetLayoutCreateInfo(
                 pNext = bound_info,
                 bindingCount=len(lb),
-                pBindings=lb
+                pBindings=lb,
+                flags=VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT
             )
             self.descriptor_set_layouts.append(
                 vkCreateDescriptorSetLayout(self.w_device.vk_device,
@@ -849,11 +855,11 @@ class PipelineBindingWrapper:
         descriptor_set_layouts_per_frame = self.descriptor_set_layouts * self.w_device.get_number_of_frames()
         var_count_info = var_count_info * self.w_device.get_number_of_frames()
         var_count = VkDescriptorSetVariableDescriptorCountAllocateInfo(
-            descriptorSetCount=0, # len(var_count_info),
+            descriptorSetCount=len(var_count_info),
             pDescriptorCounts=var_count_info,
         )
         allocate_info = VkDescriptorSetAllocateInfo(
-            pNext = var_count,
+            pNext = None, # var_count,
             descriptorPool=self.descriptor_pool,
             descriptorSetCount=len(descriptor_set_layouts_per_frame),
             pSetLayouts=descriptor_set_layouts_per_frame)
@@ -863,7 +869,7 @@ class PipelineBindingWrapper:
             size=size,
             offset=offset,
             stageFlags=stage
-        ) for k, (offset, stage, size, type, data) in self.push_constants.items()]
+        ) for stage, (offset, size, layout, data) in self.push_constants.items()]
         pipeline_layout_info = VkPipelineLayoutCreateInfo(
             setLayoutCount=4,
             pSetLayouts=self.descriptor_set_layouts,
@@ -1090,6 +1096,11 @@ class CommandBufferWrapper:
     def is_frozen(self):
         return self.__is_frozen
 
+    def clear_buffer(self, w_buffer: ResourceWrapper, value: int = 0):
+        vkCmdFillBuffer(self.vk_cmdList, w_buffer.resource_data.vk_resource,
+                        w_buffer.current_slice["offset"], w_buffer.current_slice["size"],
+                        value)
+
     def clear_color(self, w_image: ResourceWrapper, color):
         if not isinstance(color, list) and not isinstance(color, tuple):
             color = list(color)
@@ -1145,9 +1156,13 @@ class CommandBufferWrapper:
         self.current_pipeline = pipeline
         pipeline._set_at_cmdList(self.vk_cmdList, self.pool.queue_index)
 
-    def update_constant(self, field_name, field_data):
-        offset, stage, size, type, data = self.current_pipeline.push_constants[field_name]
-        data[0:size] = field_data
+    def update_constants(self, stage, **fields):
+        assert stage in self.current_pipeline.push_constants, "Current pipeline have no constant for the specified stage"
+        offset, size, layout, data = self.current_pipeline.push_constants[stage]
+        for f, v in fields.items():
+            assert f in layout, f"Field {f} was not found in that stage constants"
+            field_offset, field_size, field_type = layout[f]  # layout
+            data[field_offset:field_offset + field_size] = v
         vkCmdPushConstants(
             self.vk_cmdList,
             self.current_pipeline.pipeline_layout,
@@ -1245,7 +1260,7 @@ class ShaderStageWrapper:
                 bytecode = f.read(-1)
                 info = VkShaderModuleCreateInfo(
                     codeSize=len(bytecode),
-                    pCode=bytecode
+                    pCode=bytecode,
                 )
                 device.loaded_modules[(vk_stage, path, main_function)] = vkCreateShaderModule(
                     device=vk_device,
@@ -1561,7 +1576,8 @@ class DeviceWrapper:
             "VK_KHR_ray_query",
             "VK_KHR_pipeline_library",
             "VK_KHR_deferred_host_operations",
-            "VK_KHR_buffer_device_address"
+            "VK_KHR_buffer_device_address",
+            "VK_EXT_shader_atomic_float"
             # "GLSL_EXT_ray_tracing",
             # "GLSL_EXT_ray_query",
             # "GLSL_EXT_ray_flags_primitive_culling",
@@ -1571,7 +1587,13 @@ class DeviceWrapper:
 
         dev_features = self.__physical_devices_features[self.__physical_device]
 
+        atom_features =  VkPhysicalDeviceShaderAtomicFloatFeaturesEXT(
+            shaderBufferFloat32Atomics=True,
+            shaderBufferFloat32AtomicAdd=True,
+        )
+
         rob_features = VkPhysicalDeviceRobustness2FeaturesEXT(
+            pNext = atom_features,
             nullDescriptor=True,
         )
 
@@ -1579,13 +1601,14 @@ class DeviceWrapper:
             pNext = rob_features,
             accelerationStructure=True,
             # accelerationStructureHostCommands=True,
-            # descriptorBindingAccelerationStructureUpdateAfterBind=True,
+            descriptorBindingAccelerationStructureUpdateAfterBind=True,
         )
 
         rt_features = VkPhysicalDeviceRayTracingPipelineFeaturesKHR(
             pNext = ads_features,
             rayTracingPipeline=True,
         )
+
 
         features = VkPhysicalDeviceVulkan12Features(
             pNext=rt_features,
@@ -1595,6 +1618,13 @@ class DeviceWrapper:
             runtimeDescriptorArray=True,
             descriptorBindingVariableDescriptorCount=True,
             descriptorBindingPartiallyBound=True,
+            descriptorBindingStorageImageUpdateAfterBind=True,
+            descriptorBindingStorageBufferUpdateAfterBind=True,
+            descriptorBindingUniformBufferUpdateAfterBind=True,
+            descriptorBindingStorageTexelBufferUpdateAfterBind=True,
+            descriptorBindingUniformTexelBufferUpdateAfterBind=True,
+            descriptorBindingUpdateUnusedWhilePending=True,
+            descriptorBindingSampledImageUpdateAfterBind=True,
         )
 
         device_create = VkDeviceCreateInfo(

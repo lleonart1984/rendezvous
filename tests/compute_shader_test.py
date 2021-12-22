@@ -17,11 +17,12 @@ pipeline.load_compute_shader('./shaders/test_compute_shader.comp.spv')
 pipeline.bind_storage_image(0, ShaderStage.COMPUTE, lambda: presenter.render_target())
 pipeline.close()
 
-with presenter.get_compute() as man:
+with presenter.get_graphics() as man:
     man.set_pipeline(pipeline)
+    man.update_sets(0)
     man.dispatch_threads_2D(presenter.width, presenter.height)
 
-with presenter.get_compute() as man:
+with presenter.get_graphics() as man:
     man.gpu_to_cpu(presenter.render_target())
 
 plt.imshow(presenter.render_target().as_numpy())

@@ -2,15 +2,15 @@
 
 layout (local_size_x = 1024, local_size_y = 1, local_size_z = 1) in;
 
-layout (binding = 0) readonly buffer Parameter {
+layout (std430, binding = 0) readonly buffer Parameter {
     float data[];
 } parameters;
 
-layout (binding = 1) buffer GradParameter {
+layout (std430, binding = 1) buffer GradParameter {
     float data[];
 } grad_parameters;
 
-layout (binding = 1) readonly buffer GradOutput {
+layout (std430, binding = 2) readonly buffer GradOutput {
     float data[];
 } grad_output;
 

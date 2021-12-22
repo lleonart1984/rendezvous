@@ -16,7 +16,7 @@ class Pathtracer(Technique):
         # create accumulation image
         self.accumulation = self.create_image(ImageType.TEXTURE_2D, False,
                                               Format.VEC4, self.image.width, self.image.height,
-                                              1, 1, 1, ImageUsage.STORAGE, MemoryProperty.GPU)
+                                              1, 1, 1, ImageUsage.STORAGE | ImageUsage.TRANSFER_DST, MemoryProperty.GPU)
         # create pipeline
         pipeline = self.create_raytracing_pipeline()
         ray_gen = pipeline.load_rt_generation_shader(self.shader_folder+'/raygen.rgen.spv')
@@ -62,6 +62,8 @@ class Pathtracer(Technique):
         self.pipeline = pipeline
         self.program = program
         self.frame_index = 0
+        with self.get_graphics() as man:
+            man.clear_color(image=self.accumulation, color=(0,0,0,0))
 
     def update_camera(self, camera):
         self.camera = camera
@@ -83,12 +85,12 @@ class Pathtracer(Technique):
             man.set_pipeline(self.pipeline)
             man.update_sets(0)
             man.update_sets(1)
-            man.update_constants(frame_index=self.frame_index)
+            man.update_constants(
+                ShaderStage.RT_GENERATION,
+                frame_index=self.frame_index
+            )
             # dispatch rays
             man.dispatch_rays(self.program, self.image.width, self.image.height)
-            # copy image to render target
-            man.copy_image(self.image, self.render_target())
             # clear all dirty flags
-            self.scene_is_dirty = False
             self.camera_is_dirty = False
         self.frame_index += 1

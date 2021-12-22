@@ -1,6 +1,6 @@
 
 const vec3 LightDirection = normalize(vec3(1,4,-1));
-const vec3 LightIntensity = vec3(1,1,1) * 3.14 * 2;
+const vec3 LightIntensity = vec3(1,1,1) * 3.14;
 
 vec3 SampleSkybox(vec3 dir){
     vec3 L = dir;
@@ -29,7 +29,7 @@ vec3 SampleSkybox(vec3 dir){
 }
 
 vec3 SampleSkyboxWithSun(vec3 dir) {
-	float sun_angle = 15 * pi / 180; // 0.5 degree, sun's angular diameter from Earth
+	float sun_angle = 40 * pi / 180; // 0.5 degree, sun's angular diameter from Earth
 	float cos_sun_angle = cos(sun_angle / 2);
 	float sun_area = 2 * pi * (1 - cos_sun_angle);
 	return dot(LightDirection, dir) > cos_sun_angle ? LightIntensity / sun_area : SampleSkybox(dir);

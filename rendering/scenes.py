@@ -201,7 +201,7 @@ class SceneBuilder:
         width, height = image.size
         image = image.convert("RGBA")
         data = image.getdata()
-        texture = self.device.create_texure_2D(Format.UINT_RGBA_STD, width, height, 1, 1)
+        texture = self.device.create_texure_2D(Format.UINT_RGBA_UNORM, width, height, 1, 1)
         bytes = bytearray()
         for r,g,b,a in data:
             bytes.append(r)

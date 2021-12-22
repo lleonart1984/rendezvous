@@ -20,6 +20,8 @@ layout(scalar, set=1, binding = 4) readonly buffer Geometries { GeometryDesc dat
 layout(scalar, set=1, binding = 5) readonly buffer Instances { InstanceDesc data[]; } instances;
 layout(set=1, binding = 6) uniform sampler2D textures[100];
 
+layout(scalar, set=2, binding = 0) readonly buffer Parameters { vec3 data[]; } parameters;
+
 layout(location = 0) rayPayloadInEXT RayHitPayload Payload;
 hitAttributeEXT vec2 HitAttribs;
 
@@ -51,6 +53,22 @@ void main() {
     N = normalize(instance_to_world * vec4(model_to_instance * vec4(N, 0), 0));
 
     Material material;
+    if (instance.MaterialIndex == -2) { // Load material from parameters
+        // ASUMING RECONSTRUCTED TEXTURE TO BE 512x512x3 texture
+        ivec2 coord = ivec2(C*512);
+        material.Diffuse = parameters.data[coord.x + coord.y*512];
+        material.Opacity = 1.0;
+        material.Specular = vec3(1, 1, 1);
+        material.SpecularPower = 40;
+        material.Emissive = vec3(0, 0, 0);
+        material.RefractionIndex = 1.0/1.1;
+        material.DiffuseMap = -1;
+        material.SpecularMap = -1;
+        material.BumpMap = -1;
+        material.MaskMap = -1;
+        material.Model = vec4(1.0, 0.0, 0.0, 0.0);
+    }
+    else
     if (instance.MaterialIndex == -1) { // Load Default material
         material.Diffuse = vec3(1, 1, 1);
         material.Opacity = 1.0;

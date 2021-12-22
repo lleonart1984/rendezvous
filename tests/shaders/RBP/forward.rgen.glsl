@@ -1,20 +1,26 @@
 #version 460
 #extension GL_EXT_ray_tracing : require
 #extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : require
+
 
 #include "../Common/PTCommon.h"
 #include "../Common/Randoms.h"
 #include "../Common/PTEnvironment.h"
 
+
 layout(set = 0, binding = 0) uniform accelerationStructureEXT Scene;
-layout(set = 0, binding = 1, rgba32f) uniform image2D dL;
+layout(scalar, set = 0, binding = 1) buffer OutputImage{
+    vec3 data[];
+} output_image;
 layout(set = 0, binding = 2) uniform CameraTransforms {
     mat4 ProjToWorld;
 } camera;
 layout( push_constant ) uniform constants
 {
-	int frame_index;
-} parameters;
+	int frame_seed;
+    int number_of_samples;
+} consts;
 
 layout(location = 0) rayPayloadEXT RayHitPayload Payload;
 
@@ -46,8 +52,8 @@ void main() {
     const int payloadLocation = 0;
 
     Payload.rng_seed = initializeRandom(
-        gl_LaunchIDEXT.y + gl_LaunchIDEXT.x * gl_LaunchSizeEXT.y
-        + parameters.frame_index * gl_LaunchSizeEXT.x * gl_LaunchSizeEXT.y
+        gl_LaunchIDEXT.x + gl_LaunchIDEXT.y * gl_LaunchSizeEXT.x
+        + consts.frame_seed * gl_LaunchSizeEXT.x * gl_LaunchSizeEXT.y
     );
 
     const vec2 screen = vec2(gl_LaunchIDEXT.xy + vec2(random(Payload.rng_seed), random(Payload.rng_seed))) / vec2(gl_LaunchSizeEXT.xy);
@@ -86,8 +92,5 @@ void main() {
         ray_direction = Payload.Direction;
     }
 
-    vec3 acc = imageLoad(Accumulation, ivec2(gl_LaunchIDEXT.xy)).xyz;
-    acc += color;
-    imageStore(Accumulation, ivec2(gl_LaunchIDEXT.xy), vec4(acc, 1));
-    imageStore(OutputImage, ivec2(gl_LaunchIDEXT.xy), vec4(pow(acc / (parameters.frame_index + 1), vec3(0.5)), 1));
+    output_image.data[gl_LaunchIDEXT.x + gl_LaunchIDEXT.y * gl_LaunchSizeEXT.x] += color / consts.number_of_samples;
 }

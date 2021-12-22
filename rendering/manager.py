@@ -11,7 +11,7 @@ import struct
 import torch
 
 
-def compile_shader_sources(directory='.'):
+def compile_shader_sources(directory='.', force_all: bool = False):
     import os
     import subprocess
     def needs_to_update(source, binary):
@@ -22,7 +22,7 @@ def compile_shader_sources(directory='.'):
         if extension == '.glsl':
             stage = os.path.splitext(filename_without_extension)[1][1:]  # [1:] for removing the dot .
             binary_file = filename_without_extension + ".spv"
-            if needs_to_update(filename, binary_file):
+            if needs_to_update(filename, binary_file) or force_all:
                 p = subprocess.Popen(
                     os.path.expandvars('%VULKAN_SDK%/Bin/glslangValidator.exe -r -V --target-env vulkan1.2 ').replace("\\","/")
                     + f'-S {stage} {filename} -o {binary_file}'
@@ -84,6 +84,7 @@ class Format(IntEnum):
     UINT_RGB = VK_FORMAT_R8G8B8_UINT
     UINT_BGRA_STD = VK_FORMAT_B8G8R8A8_SRGB
     UINT_RGBA_STD = VK_FORMAT_R8G8B8A8_SRGB
+    UINT_RGBA_UNORM = VK_FORMAT_R8G8B8A8_UNORM
     UINT_BGRA_UNORM = VK_FORMAT_B8G8R8A8_UNORM
     FLOAT = VK_FORMAT_R32_SFLOAT
     INT = VK_FORMAT_R32_SINT
@@ -255,6 +256,7 @@ class Resource(object):
 class Buffer(Resource):
     def __init__(self, w_buffer: vkw.ResourceWrapper):
         super().__init__(w_buffer)
+        self.size = w_buffer.current_slice["size"]
 
     def slice(self, offset, size):
         return Buffer(self.w_resource.slice_buffer(offset, size))
@@ -308,7 +310,7 @@ class Uniform(Buffer):
         w_buffer.get_permanent_map()
 
     def __getattr__(self, item):
-        if item == "layout" or item == "w_resource":
+        if item == "layout" or item == "w_resource" or item == "size":
             return super(Uniform, self).__getattribute__(item)
         if item not in self.layout:
             return super(Uniform, self).__getattribute__(item)
@@ -318,7 +320,7 @@ class Uniform(Buffer):
         return BinaryFormatter.from_bytes(type, buffer)
 
     def __setattr__(self, item, value):
-        if item == "layout" or item == "w_resource":
+        if item == "layout" or item == "w_resource" or item == "size":
             super(Uniform, self).__setattr__(item, value)
             return
         if item in self.layout:
@@ -652,10 +654,7 @@ class Pipeline:
 
     def bind_constants(self, offset: int, stage: ShaderStage, **fields):
         layout, size = Uniform.process_layout(fields)
-        for field_name, (field_offset, field_size, field_type) in layout.items():
-            self.w_pipeline.add_constant_range(
-                stage, field_name, offset+field_offset, field_size, field_type
-            )
+        self.w_pipeline.add_constant_range(stage, offset, size, layout)
 
     def load_shader(self, stage: ShaderStage, path, main_function = 'main'):
         return self.w_pipeline.load_shader(vkw.ShaderStageWrapper.from_file(
@@ -761,6 +760,9 @@ class ComputeManager(CopyManager):
 
     def clear_color(self, image: Image, color):
         self.w_cmdList.clear_color(image.w_resource, color)
+    
+    def clear_buffer(self, buffer: Buffer, value: int = 0):
+        self.w_cmdList.clear_buffer(buffer.w_resource, value)
 
     def set_pipeline(self, pipeline: Pipeline):
         if not pipeline.is_closed():
@@ -771,9 +773,11 @@ class ComputeManager(CopyManager):
         for s in sets:
             self.w_cmdList.update_bindings_level(s)
 
-    def update_constants(self, **fields):
-        for k, v in fields.items():
-            self.w_cmdList.update_constant(k, BinaryFormatter.to_bytes(type=type(v), value=v))
+    def update_constants(self, stages, **fields):
+        self.w_cmdList.update_constants(stages, **{
+            f: BinaryFormatter.to_bytes(type=type(v), value=v)
+            for f, v in fields.items()
+        })
 
     def dispatch_groups(self, groups_x: int, groups_y: int = 1, groups_z:int = 1):
         self.w_cmdList.dispatch_groups(groups_x, groups_y, groups_z)
@@ -837,6 +841,7 @@ class DeviceManager:
         return technique
 
     def dispatch_technique(self, technique):
+        assert technique.w_device, "Technique is not bound to a device, you must load the technique in some point before dispatching"
         technique.__dispatch__()
 
     def create_buffer(self, size: int, usage: int, memory: MemoryProperty):
@@ -872,20 +877,6 @@ class DeviceManager:
             image_type, image_format, VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT if is_cube else 0,
             VkExtent3D(width, height, depth), mips, layers, linear, layout, usage, memory
         ))
-
-    def create_buffer_uniform(self, size):
-        return self.create_buffer(
-            size=size,
-            usage=BufferUsage.UNIFORM | BufferUsage.TRANSFER_DST,
-            memory=MemoryProperty.DYNAMIC
-        )
-
-    def create_buffer_staging(self, size):
-        return self.create_buffer(
-            size=size,
-            usage=BufferUsage.TRANSFER_SRC | BufferUsage.TRANSFER_DST,
-            memory=MemoryProperty.CPU_ACCESSIBLE
-        )
 
     def create_triangle_collection(self):
         return TriangleCollection(device=self.w_device)

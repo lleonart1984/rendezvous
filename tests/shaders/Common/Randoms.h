@@ -38,7 +38,7 @@ vec3 randomDirection(inout uvec4 rng_state, vec3 D) {
 	float r2 = random(rng_state) * 2 - 1;
 	float sqrR2 = r2 * r2;
 	float two_pi_by_r1 = two_pi * r1;
-	float sqrt_of_one_minus_sqrR2 = sqrt(1.0 - sqrR2);
+	float sqrt_of_one_minus_sqrR2 = sqrt(max(0, 1.0 - sqrR2));
 	float x = cos(two_pi_by_r1) * sqrt_of_one_minus_sqrR2;
 	float y = sin(two_pi_by_r1) * sqrt_of_one_minus_sqrR2;
 	float z = r2;
@@ -52,7 +52,7 @@ vec3 randomHSDirection(inout uvec4 rng_state, vec3 D) {
 	float r2 = random(rng_state);
 	float sqrR2 = r2 * r2;
 	float two_pi_by_r1 = two_pi * r1;
-	float sqrt_of_one_minus_sqrR2 = sqrt(1.0 - sqrR2);
+	float sqrt_of_one_minus_sqrR2 = sqrt(max(0, 1.0 - sqrR2));
 	float x = cos(two_pi_by_r1) * sqrt_of_one_minus_sqrR2;
 	float y = sin(two_pi_by_r1) * sqrt_of_one_minus_sqrR2;
 	float z = r2;

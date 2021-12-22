@@ -3,10 +3,15 @@
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_shader_atomic_float : require
 
+
+#include "./RBPCommon.h"
 #include "../Common/PTCommon.h"
 #include "../Common/Randoms.h"
 #include "../Common/SurfaceScattering.h"
+#include "../Common/PTEnvironment.h"
+
 
 /*
 Logic for scattering of light and surface.
@@ -20,7 +25,10 @@ layout(scalar, set=1, binding = 4) readonly buffer Geometries { GeometryDesc dat
 layout(scalar, set=1, binding = 5) readonly buffer Instances { InstanceDesc data[]; } instances;
 layout(set=1, binding = 6) uniform sampler2D textures[100];
 
-layout(location = 0) rayPayloadInEXT RayHitPayload Payload;
+layout(scalar, set=2, binding = 0) readonly buffer Parameters { vec3 data[]; } parameters;
+layout(scalar, set=2, binding = 1) buffer GradParameters { vec3 data[]; } grad_parameters;
+
+layout(location = 0) rayPayloadInEXT RBPRayHitPayload Payload;
 hitAttributeEXT vec2 HitAttribs;
 
 void main() {
@@ -51,6 +59,22 @@ void main() {
     N = normalize(instance_to_world * vec4(model_to_instance * vec4(N, 0), 0));
 
     Material material;
+    if (instance.MaterialIndex == -2) { // Load material from parameters
+        // ASUMING RECONSTRUCTED TEXTURE TO BE 512x512x3 texture
+        ivec2 coord = ivec2(C*512);
+        material.Diffuse = parameters.data[coord.x + coord.y*512];
+        material.Opacity = 1.0;
+        material.Specular = vec3(1, 1, 1);
+        material.SpecularPower = 40;
+        material.Emissive = vec3(0, 0, 0);
+        material.RefractionIndex = 1.0/1.1;
+        material.DiffuseMap = -1;
+        material.SpecularMap = -1;
+        material.BumpMap = -1;
+        material.MaskMap = -1;
+        material.Model = vec4(1.0, 0.0, 0.0, 0.0);
+    }
+    else
     if (instance.MaterialIndex == -1) { // Load Default material
         material.Diffuse = vec3(1, 1, 1);
         material.Opacity = 1.0;
@@ -62,7 +86,7 @@ void main() {
         material.SpecularMap = -1;
         material.BumpMap = -1;
         material.MaskMap = -1;
-        material.Model = vec4(1.0, 0.0, 0.0, 0);
+        material.Model = vec4(1.0, 0.0, 0.0, 0.0);
     }
     else // Load material from buffer
     material = materials.data[instance.MaterialIndex];
@@ -78,4 +102,15 @@ void main() {
     Payload.Position = P;
     SurfaceScatter(Payload.rng_seed, Payload.Position, V, N, material,
     Payload.Direction, Payload.BRDF_cos, Payload.PDF);
+
+    if (instance.MaterialIndex == -2) { // Update grad_parameters
+        // Compute Li(Payload.Position, Payload.Direction)
+        vec3 Li = vec3(1,1,1); //SampleSkyboxWithSun(Payload.Direction); // TODO: IMPLEMENT A SHADOW RAY HERE OR A PT
+        vec3 dx = Payload.grad_output * Li / Payload.PDF;
+        // ASUMING RECONSTRUCTED TEXTURE TO BE 512x512x3 texture
+        ivec2 coord = ivec2(C*512);
+        atomicAdd(grad_parameters.data[coord.x + coord.y*512].x, dx.x);
+        atomicAdd(grad_parameters.data[coord.x + coord.y*512].y, dx.y);
+        atomicAdd(grad_parameters.data[coord.x + coord.y*512].z, dx.z);
+    }
 }
