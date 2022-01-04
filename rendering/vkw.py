@@ -498,10 +498,10 @@ class ResourceWrapper:
     def write(self, bytes):
         if isinstance(bytes, list):
             bytes = np.array(bytes)
+        if isinstance(bytes, torch.Tensor):
+            bytes = bytes.numpy()
         if isinstance(bytes, np.ndarray):  # get buffer from numpy array
             bytes = bytes.data.cast('b')
-        if isinstance(bytes, torch.Tensor):
-            bytes = np.array(bytes).data.cast('b')
         if self.resource_data.is_buffer:
             offset = self.current_slice["offset"]
             size = self.current_slice["size"]
@@ -543,6 +543,8 @@ class ResourceWrapper:
                     self.resource_data.unmap()
 
     def read(self, bytes):
+        if isinstance(bytes, torch.Tensor):
+            bytes = bytes.numpy()
         if isinstance(bytes, np.ndarray):  # get buffer from numpy array
             bytes = bytes.data.cast('b')
         if self.resource_data.is_buffer:
@@ -1343,13 +1345,14 @@ class CommandPoolWrapper:
             cmdLists.append(m.vk_cmdList)
             m.state = CommandListState.SUBMITTED
 
-        vkQueueSubmit(self.vk_queue, 1,
+        if len(cmdLists) > 0:
+            vkQueueSubmit(self.vk_queue, 1,
 
-                          VkSubmitInfo(
-                              commandBufferCount=len(cmdLists),
-                              pCommandBuffers=cmdLists
-                          )
-                      , None)
+                              VkSubmitInfo(
+                                  commandBufferCount=len(cmdLists),
+                                  pCommandBuffers=cmdLists
+                              )
+                          , None)
 
         vkQueueWaitIdle(self.vk_queue)
         for c in managers:
@@ -1917,8 +1920,8 @@ class DeviceWrapper:
 
         raise Exception("failed to find suitable memory type!")
 
-    def __resolve_initial_state(self, is_buffer, usage, properties):
-        if usage == VK_BUFFER_USAGE_STORAGE_BUFFER_BIT:
+    def __resolve_initial_state(self, is_buffer, is_ads, usage, properties):
+        if is_ads:
             return ResourceState(
                 vk_access=VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
                 vk_stage=VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
@@ -1932,7 +1935,7 @@ class DeviceWrapper:
             queue_index=VK_QUEUE_FAMILY_IGNORED
         )
 
-    def create_buffer_data(self, size, usage, properties):
+    def create_buffer_data(self, size, usage, properties, is_ads = False):
         info = VkBufferCreateInfo(
             size=size,
             usage=usage,
@@ -1946,10 +1949,10 @@ class DeviceWrapper:
         buffer_memory = vkAllocateMemory(self.vk_device, allocInfo, None)
         vkBindBufferMemory(self.vk_device, buffer, buffer_memory, 0)
         return ResourceData(self, info, properties, buffer, buffer_memory, True,
-                               self.__resolve_initial_state(True, usage, properties))
+                               self.__resolve_initial_state(True, is_ads, usage, properties))
 
-    def create_buffer(self, size, usage, properties):
-        return ResourceWrapper(resource_data=self.create_buffer_data(size, usage, properties))
+    def create_buffer(self, size, usage, properties, is_ads: bool = False):
+        return ResourceWrapper(resource_data=self.create_buffer_data(size, usage, properties, is_ads))
 
     def _get_device_address(self, buffer):
         if buffer is None:
@@ -2041,7 +2044,7 @@ class DeviceWrapper:
         # Create a buffer to store the ads
         ads_buffer = self.create_buffer(sizes.accelerationStructureSize * 2,
                            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, True)
         # Create object
         create_info = VkAccelerationStructureCreateInfoKHR(
             buffer=ads_buffer.resource_data.vk_resource,
@@ -2076,7 +2079,7 @@ class DeviceWrapper:
         vkBindImageMemory(self.vk_device, image, image_memory, 0)
 
         resource_data = ResourceData(self, info, properties, image, image_memory, False,
-                     self.__resolve_initial_state(False, usage, properties))
+                     self.__resolve_initial_state(False, False, usage, properties))
         return ResourceWrapper(resource_data)
 
     def create_sampler(self, mag_filter, min_filter, mipmap_mode, address_U, address_V, address_W,

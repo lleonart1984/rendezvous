@@ -1,12 +1,18 @@
 from rendering.manager import *
 from rendering.scenes import *
+import os
+
+__PT_SHADERS__ = os.path.dirname(__file__)+"/shaders/PT"
+
+compile_shader_sources(__PT_SHADERS__)
+
 
 class Pathtracer(Technique):
-    def __init__(self, scene: RaytracingScene, image, shader_folder):
+    def __init__(self, scene: RaytracingScene, image):
         super().__init__()
         self.scene = scene
         self.image = image
-        self.shader_folder = shader_folder
+        self.shader_folder = __PT_SHADERS__
         self.pipeline = None
         self.program = None
         self.camera_uniform = None

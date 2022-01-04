@@ -1,17 +1,24 @@
 from rendering.manager import *
 from rendering.scenes import *
 import random
+import os
+
+
+__RBG_SHADERS__ = os.path.dirname(__file__)+"/shaders/RBP"
+
+
+compile_shader_sources(__RBG_SHADERS__)
 
 
 class RBPForward(Technique):
-    def __init__(self, scene: RaytracingScene, image_width, image_height, input_parameters, output_image, shader_folder):
+    def __init__(self, scene: RaytracingScene, image_width, image_height, input_parameters, output_image):
         super().__init__()
         self.scene = scene
         self.image_width = image_width
         self.image_height = image_height
         self.input_parameters = input_parameters  # Flatten texture 512x512 used as parameters
         self.output_image = output_image  # Flatten output image of the pathtracer
-        self.shader_folder = shader_folder
+        self.shader_folder = __RBG_SHADERS__
         self.pipeline = None
         self.program = None
         self.camera_uniform = None
@@ -100,7 +107,7 @@ class RBPForward(Technique):
 
 
 class RBPBackward(Technique):
-    def __init__(self, scene: RaytracingScene, image_width, image_height, input_parameters, grad_parameters, grad_output, shader_folder):
+    def __init__(self, scene: RaytracingScene, image_width, image_height, input_parameters, grad_parameters, grad_output):
         super().__init__()
         self.scene = scene
         self.image_width = image_width
@@ -108,7 +115,7 @@ class RBPBackward(Technique):
         self.input_parameters = input_parameters  # Flatten texture 512x512 used as parameters
         self.grad_parameters = grad_parameters  # parameters of the scene
         self.grad_output = grad_output  # gradients for the parameters of the scene
-        self.shader_folder = shader_folder
+        self.shader_folder = __RBG_SHADERS__
         self.pipeline = None
         self.program = None
         self.camera_uniform = None

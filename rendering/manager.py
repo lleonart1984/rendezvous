@@ -9,11 +9,11 @@ from typing import List, Dict, Tuple
 import glm
 import struct
 import torch
+import os
+import subprocess
 
 
 def compile_shader_sources(directory='.', force_all: bool = False):
-    import os
-    import subprocess
     def needs_to_update(source, binary):
         return not os.path.exists(binary) or os.path.getmtime(source) > os.path.getmtime(binary)
     for filename in os.listdir(directory):
@@ -30,6 +30,10 @@ def compile_shader_sources(directory='.', force_all: bool = False):
                 p.wait()
                 print(f'[INFO] Compiled... {filename}')
 
+
+__SHADERS_TOOLS__ = os.path.dirname(__file__) + "/shaders/Tools"
+
+compile_shader_sources(__SHADERS_TOOLS__)
 
 # ------------ ALIASES ---------------
 
@@ -184,6 +188,8 @@ class BinaryFormatter:
         int: 4,
         float: 4,  # not really but more legible in graphics context
 
+        glm.uint64: 8,
+
         glm.vec1: 4,
         glm.float32: 4,
         glm.vec2: 4 * 2,
@@ -227,6 +233,8 @@ class BinaryFormatter:
             return struct.pack('i', value)
         if type == float:
             return struct.pack('f', value)
+        if type == glm.uint64:
+            return struct.pack('<Q', value.value)
         return type.to_bytes(value)
 
     @staticmethod
@@ -236,14 +244,17 @@ class BinaryFormatter:
             return struct.unpack('i', buffer)[0]
         if type == float:
             return struct.unpack('f', buffer)[0]
+        if type == glm.uint64:
+            return struct.unpack('Q', buffer)[0]
         if isinstance(buffer, bytearray):
             return type.from_bytes(bytes(buffer))
         return type.from_bytes(ffi.buffer(buffer)[0:BinaryFormatter.size_of(type)])
 
 
 class Resource(object):
-    def __init__(self, w_resource: vkw.ResourceWrapper):
+    def __init__(self, device, w_resource: vkw.ResourceWrapper):
         self.w_resource = w_resource
+        self.device = device
 
     def get_footprints(self) -> List[Footprint]:
         if self.w_resource.resource_data.is_buffer:
@@ -252,44 +263,58 @@ class Resource(object):
             subresources = self.w_resource.current_slice["array_count"] * self.w_resource.current_slice["mips_count"]
         return [self.w_resource.resource_data.get_staging_footprint_and_offset(i)[0] for i in range(subresources)]
 
+    def __del__(self):
+        self.device = None
+        self.w_resource = None
+
 
 class Buffer(Resource):
-    def __init__(self, w_buffer: vkw.ResourceWrapper):
-        super().__init__(w_buffer)
+    def __init__(self, device, w_buffer: vkw.ResourceWrapper):
+        super().__init__(device, w_buffer)
         self.size = w_buffer.current_slice["size"]
 
     def slice(self, offset, size):
-        return Buffer(self.w_resource.slice_buffer(offset, size))
+        return Buffer(self.device, self.w_resource.slice_buffer(offset, size))
 
     def write(self, data):
         self.w_resource.write(data)
 
-    def write_direct(self, device, data):
+    def write_direct(self, data):
         self.write(data)
-        with device.get_copy() as man:
+        with self.device.get_compute() as man:
             man.cpu_to_gpu(self)
 
     def read(self, data):
         self.w_resource.read(data)
 
-    def read_direct(self, device, data):
-        with device.get_copy() as man:
+    def read_direct(self, data):
+        with self.device.get_compute() as man:
             man.gpu_to_cpu(self)
         self.read(data)
 
-
     def structured(self, **fields):
         layout, size = Uniform.process_layout(fields)
-        return StructuredBuffer(self.w_resource, layout, size)
+        return StructuredBuffer(self.device, self.w_resource, layout, size)
 
     def as_indices(self):
-        return IndexBuffer(self.w_resource)
+        return IndexBuffer(self.device, self.w_resource)
 
     def as_numpy(self, dtype: np.dtype = np.float32()):
         return self.w_resource.as_numpy(dtype)
 
-    def as_torch(self, dtype: np.dtype = np.float32()):
-        return torch.Tensor(self.as_numpy(dtype))
+    def as_tensor(self, dtype: np.dtype = np.float32()):
+        tensor =  torch.Tensor(self.as_numpy(dtype))
+        tensor.inner_vk_resource = self
+        return tensor
+
+    def create_gpu_tensor(self):
+        tensor = torch.zeros(self.size // 4).to(torch.device('cuda:0'))
+        self.device.copy_buffer_to_gpu_pointer(tensor.data_ptr(), self, self.size)
+        return tensor
+
+    def __str__(self):
+        gpu_tensor = self.create_gpu_tensor()
+        return str(gpu_tensor)+'\n'+str(gpu_tensor.min())+'\n'+str(gpu_tensor.max())
 
 
 class Uniform(Buffer):
@@ -304,13 +329,13 @@ class Uniform(Buffer):
             offset += field_size
         return layout, offset
 
-    def __init__(self, w_buffer: vkw.ResourceWrapper, layout: Dict[str, Tuple[int, int, type]]):
+    def __init__(self, device, w_buffer: vkw.ResourceWrapper, layout: Dict[str, Tuple[int, int, type]]):
         self.layout = layout
-        super().__init__(w_buffer)
+        super().__init__(device, w_buffer)
         w_buffer.get_permanent_map()
 
     def __getattr__(self, item):
-        if item == "layout" or item == "w_resource" or item == "size":
+        if item == "layout" or item == "w_resource" or item == "size" or item == "device":
             return super(Uniform, self).__getattribute__(item)
         if item not in self.layout:
             return super(Uniform, self).__getattribute__(item)
@@ -320,7 +345,7 @@ class Uniform(Buffer):
         return BinaryFormatter.from_bytes(type, buffer)
 
     def __setattr__(self, item, value):
-        if item == "layout" or item == "w_resource" or item == "size":
+        if item == "layout" or item == "w_resource" or item == "size" or item == "device":
             super(Uniform, self).__setattr__(item, value)
             return
         if item in self.layout:
@@ -332,9 +357,9 @@ class Uniform(Buffer):
 
 
 class StructuredBuffer(Buffer):
-    def __init__(self, w_buffer: vkw.ResourceWrapper, layout: Dict[str, Tuple[int, int, type]], stride: int):
+    def __init__(self, device, w_buffer: vkw.ResourceWrapper, layout: Dict[str, Tuple[int, int, type]], stride: int):
         self.layout = layout
-        super().__init__(w_buffer)
+        super().__init__(device, w_buffer)
         w_buffer.get_permanent_map()
         self.stride = stride
 
@@ -343,8 +368,8 @@ class StructuredBuffer(Buffer):
 
 
 class IndexBuffer(Buffer):
-    def __init__(self, w_buffer: vkw.ResourceWrapper):
-        super().__init__(w_buffer)
+    def __init__(self, device, w_buffer: vkw.ResourceWrapper):
+        super().__init__(device, w_buffer)
         w_buffer.get_permanent_map()
 
     def __getitem__(self, item):
@@ -363,8 +388,8 @@ class Image(Resource):
     def compute_dimension(width: int, height: int, depth: int, mip_level: int):
         return max(1, width // (1 << mip_level)), max(1, height // (1 << mip_level)), max(1, depth // (1 << mip_level))
 
-    def __init__(self, w_image: vkw.ResourceWrapper):
-        super().__init__(w_image)
+    def __init__(self, device, w_image: vkw.ResourceWrapper):
+        super().__init__(device, w_image)
         self.width, self.height, self.depth = Image.compute_dimension(
             w_image.resource_data.vk_description.extent.width,
             w_image.resource_data.vk_description.extent.height,
@@ -381,13 +406,13 @@ class Image(Resource):
         return self.w_resource.current_slice["array_count"]
 
     def slice_mips(self, mip_start, mip_count):
-        return Image(self.w_resource.slice_mips(mip_start, mip_count))
+        return Image(self.device, self.w_resource.slice_mips(mip_start, mip_count))
 
     def slice_array(self, array_start, array_count):
-        return Image(self.w_resource.slice_array(array_start, array_count))
+        return Image(self.device, self.w_resource.slice_array(array_start, array_count))
 
     def subresource(self, mip=0, layer=0):
-        return Image(self.w_resource.subresource(mip, layer))
+        return Image(self.device, self.w_resource.subresource(mip, layer))
 
     def write(self, data):
         self.w_resource.write(data)
@@ -396,7 +421,7 @@ class Image(Resource):
         self.w_resource.read(data)
 
     def as_readonly(self):
-        return Image(self.w_resource.as_readonly())
+        return Image(self.device, self.w_resource.as_readonly())
 
     def as_numpy(self):
         return self.w_resource.as_numpy()
@@ -532,8 +557,8 @@ class Instance:
 
 
 class InstanceBuffer(Resource):
-    def __init__(self, w_buffer: vkw.ResourceWrapper, instances: int):
-        super().__init__(w_buffer)
+    def __init__(self, device, w_buffer: vkw.ResourceWrapper, instances: int):
+        super().__init__(device, w_buffer)
         self.buffer = self.w_resource.get_permanent_map()
         self.number_of_instances = instances
         self.geometries = [None]*instances  # list to keep referenced geometry's wrappers alive
@@ -543,9 +568,9 @@ class InstanceBuffer(Resource):
 
 
 class ADS(Resource):
-    def __init__(self, w_resource: vkw.ResourceWrapper, handle, scratch_size,
+    def __init__(self, device, w_resource: vkw.ResourceWrapper, handle, scratch_size,
                  info: VkAccelerationStructureCreateInfoKHR, ranges, instance_buffer = None):
-        super().__init__(w_resource)
+        super().__init__(device, w_resource)
         self.ads = w_resource.resource_data.ads
         self.ads_info = info
         self.handle = handle
@@ -826,6 +851,13 @@ class DeviceManager:
         self.w_state = None
         self.width = 0
         self.height = 0
+        self.__copying_from_gpu_pipeline = None
+        self.__copying_to_gpu_pipeline = None
+
+    def __del__(self):
+        self.__copying_to_gpu_pipeline = None
+        self.__copying_from_gpu_pipeline = None
+        self.w_device = None
 
     def __bind__(self, w_device: vkw.DeviceWrapper):
         self.w_device = w_device
@@ -833,7 +865,7 @@ class DeviceManager:
         self.height = w_device.get_render_target(0).resource_data.vk_description.extent.height
 
     def render_target(self):
-        return Image(self.w_device.get_render_target(self.w_device.get_render_target_index()))
+        return Image(self, self.w_device.get_render_target(self.w_device.get_render_target_index()))
 
     def load_technique(self, technique):
         technique.__bind__(self.w_device)
@@ -845,14 +877,14 @@ class DeviceManager:
         technique.__dispatch__()
 
     def create_buffer(self, size: int, usage: int, memory: MemoryProperty):
-        return Buffer(self.w_device.create_buffer(size, usage, memory))
+        return Buffer(self, self.w_device.create_buffer(size, usage, memory))
 
     def create_uniform_buffer(self, usage: int = BufferUsage.UNIFORM,
                        memory: MemoryProperty = MemoryProperty.CPU_ACCESSIBLE,
                        **fields):
         layout, size = Uniform.process_layout(fields)
         resource = self.w_device.create_buffer(size, usage, memory)
-        return Uniform(resource, layout)
+        return Uniform(self, resource, layout)
 
     def create_structured_buffer(self, count:int,
                                     usage: int = BufferUsage.VERTEX | BufferUsage.TRANSFER_DST,
@@ -860,12 +892,12 @@ class DeviceManager:
                                     **fields):
         layout, size = Uniform.process_layout(fields)
         resource = self.w_device.create_buffer(size * count, usage, memory)
-        return StructuredBuffer(resource, layout, size)
+        return StructuredBuffer(self, resource, layout, size)
 
     def create_indices_buffer(self, count: int,
                               usage: int = BufferUsage.INDEX | BufferUsage.TRANSFER_DST,
                               memory: MemoryProperty = MemoryProperty.GPU):
-        return IndexBuffer(self.w_device.create_buffer(count*4, usage, memory))
+        return IndexBuffer(self, self.w_device.create_buffer(count*4, usage, memory))
 
     def create_image(self, image_type: ImageType, is_cube: bool, image_format: Format,
                      width: int, height: int, depth: int,
@@ -873,7 +905,7 @@ class DeviceManager:
                      usage: int, memory: MemoryProperty):
         linear = False  # bool(usage & (VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
         layout = VK_IMAGE_LAYOUT_UNDEFINED
-        return Image(self.w_device.create_image(
+        return Image(self, self.w_device.create_image(
             image_type, image_format, VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT if is_cube else 0,
             VkExtent3D(width, height, depth), mips, layers, linear, layout, usage, memory
         ))
@@ -889,7 +921,7 @@ class DeviceManager:
                 for v, i, t in collection.descriptions
             ]
         )
-        return ADS(ads, handle, scratch_size, info, ranges)
+        return ADS(self, ads, handle, scratch_size, info, ranges)
 
     def create_scene_ads(self, instance_buffer: InstanceBuffer):
         ads, info, ranges, handle, scratch_size = self.w_device.create_ads(
@@ -904,7 +936,7 @@ class DeviceManager:
         buffer = self.w_device.create_buffer(instances*64,
                                              BufferUsage.RAYTRACING_ADS_READ | BufferUsage.TRANSFER_DST,
                                              memory)
-        return InstanceBuffer(buffer, instances)
+        return InstanceBuffer(self, buffer, instances)
 
     def create_scratch_buffer(self, *ads_set):
         size = max(a.scratch_size for a in ads_set)
@@ -1023,6 +1055,56 @@ class DeviceManager:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.flush()
+
+    def copy_gpu_pointer_to_buffer(self, gpu_pointer, buffer, size):
+        if not self.__copying_from_gpu_pipeline:
+            # Create pipeline to copy gpu pointer
+            pipeline = self.create_compute_pipeline()
+            pipeline.bind_storage_buffer(0, ShaderStage.COMPUTE, lambda: self.__copying_from_gpu_pipeline.buffer)
+            pipeline.bind_constants(
+                0, ShaderStage.COMPUTE,
+                pointer=glm.uint64,
+                size=int
+            )
+            pipeline.load_compute_shader(__SHADERS_TOOLS__+"/copy_from_gpu_pointer.comp.spv")
+            pipeline.close()
+            self.__copying_from_gpu_pipeline = pipeline
+
+        self.__copying_from_gpu_pipeline.buffer = buffer
+        with self.get_compute() as man:
+            man.set_pipeline(self.__copying_from_gpu_pipeline)
+            man.update_sets(0)
+            man.update_constants(
+                ShaderStage.COMPUTE,
+                pointer=glm.uint64(gpu_pointer),
+                size=size
+            )
+            man.dispatch_threads_1D(int(math.ceil(size/(4*128))))
+        self.flush()
+
+    def copy_buffer_to_gpu_pointer(self, gpu_pointer, buffer, size):
+        if not self.__copying_to_gpu_pipeline:
+            # Create pipeline to copy gpu pointer
+            pipeline = self.create_compute_pipeline()
+            pipeline.bind_storage_buffer(0, ShaderStage.COMPUTE, lambda: self.__copying_to_gpu_pipeline.buffer)
+            pipeline.bind_constants(
+                0, ShaderStage.COMPUTE,
+                pointer=glm.uint64,
+                size=int
+            )
+            pipeline.load_compute_shader(__SHADERS_TOOLS__+"/copy_to_gpu_pointer.comp.spv")
+            pipeline.close()
+            self.__copying_to_gpu_pipeline = pipeline
+        self.__copying_to_gpu_pipeline.buffer = buffer
+        with self.get_compute() as man:
+            man.set_pipeline(self.__copying_to_gpu_pipeline)
+            man.update_sets(0)
+            man.update_constants(
+                ShaderStage.COMPUTE,
+                pointer=glm.uint64(gpu_pointer),
+                size=size
+            )
+            man.dispatch_threads_1D(int(math.ceil(size/(4*128))))
 
 
 class Presenter(DeviceManager):

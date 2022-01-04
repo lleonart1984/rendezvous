@@ -3,13 +3,7 @@ from glm import *
 import matplotlib.pyplot as plt
 from techniques.pathtracer import Pathtracer
 from techniques.radiativebackprop import *
-import os
 import torch
-import torch.nn as nn
-import random
-
-compile_shader_sources('./shaders/PT', force_all=True)
-compile_shader_sources('./shaders/RBP', force_all=True)
 
 image_width = 1024
 image_height = 1024
@@ -62,7 +56,7 @@ def generate_pathtraced_target():
     This image will be used as Target
     """
     raytracing_scene = create_scene(presenter)
-    technique = Pathtracer(raytracing_scene, presenter.render_target(), './shaders/PT')
+    technique = Pathtracer(raytracing_scene, presenter.render_target())
     presenter.load_technique(technique)
     technique.update_camera(camera)
 
@@ -76,33 +70,38 @@ def generate_pathtraced_target():
     return presenter.render_target().as_numpy()
 
 
-class TrainableTexture(TrainableRenderer):
-    def __init__(self, device: DeviceManager, scene: RaytracingScene):
+class TrainableTexture(RendererModule):
+    def __init__(self, device: DeviceManager, scene: RaytracingScene, camera: Camera):
+        self.scene = scene
+        self.camera = camera
         super().__init__(
             device,
-            512*512*3,  # input parameters for the texture to reconstruct
-            presenter.width*presenter.height*3  # output values for the image rendered
+            [],
+            [512*512*3],  # parameters for the texture to reconstruct
+            [presenter.width*presenter.height*3]  # output values for the image rendered
         )
-        self.device = device
+
+    def setup(self):
         self.forward_technique = RBPForward(
-            scene,
+            self.scene,
             presenter.width, presenter.height,
-            input_parameters=self.v_input,
-            output_image=self.v_output,
-            shader_folder='./shaders/RBP'
+            input_parameters=self.get_param(),
+            output_image=self.get_output()
         )
         self.backward_technique = RBPBackward(
-            scene,
+            self.scene,
             presenter.width, presenter.height,
-            input_parameters=self.v_input,
-            grad_parameters=self.grad_input,
-            grad_output=self.grad_output,
-            shader_folder='./shaders/RBP'
+            input_parameters=self.get_param(),
+            grad_parameters=self.get_param_gradient(),
+            grad_output=self.get_output_gradient()
         )
         self.device.load_technique(self.forward_technique)
         self.device.load_technique(self.backward_technique)
         self.forward_technique.number_of_samples = 16
         self.backward_technique.number_of_samples = 16
+        self.P = self.get_param_tensor()
+        torch.nn.init.uniform_(self.P, .0, 0.0)
+        self.update_camera(self.camera)
 
     def update_camera(self, camera):
         self.forward_technique.update_camera(camera)
@@ -113,6 +112,25 @@ class TrainableTexture(TrainableRenderer):
 
     def backward_render(self):
         self.device.dispatch_technique(self.backward_technique)
+
+    def forward_params(self):
+        return [torch.clamp(p, 0, 1) for p in self.params_tensors]
+
+    def show_parameters(self):
+        plt.imshow(self.P.detach().numpy().reshape((512,512,3)))
+        plt.show()
+
+    def show_grad_output(self):
+        im = self.get_output_gradient().as_numpy().reshape((presenter.height, presenter.width, 3))
+        # im = np.sum(im, axis=2)
+        plt.imshow(im*0.5+0.5)
+        plt.show()
+
+    def show_grad_param(self):
+        im = self.get_param_gradient().as_numpy().reshape((512, 512, 3))
+        # im = np.sum(im, axis=2)
+        plt.imshow(im*0.5+0.5)
+        plt.show()
 
 
 # Use cached target image if already exists
@@ -127,36 +145,8 @@ plt.show()
 
 target = torch.Tensor(pt_image[:,:,(0,1,2)].flatten())
 
-class MyModule(nn.Module):
-    def __init__(self, scene: RaytracingScene, camera: Camera):
-        super(MyModule, self).__init__()
-        self.renderer = TrainableTexture(presenter, scene)
-        self.renderer.update_camera(camera)
-        self.module = RenderingModule(self.renderer)
-        self.P = torch.nn.Parameter(torch.zeros(512*512*3))
-        torch.nn.init.uniform_(self.P, .0, 0.0)
 
-    def forward(self):
-        return self.module(torch.clamp(self.P, 0, 1))
-
-    def show_parameters(self):
-        plt.imshow(self.P.detach().numpy().reshape((512,512,3)))
-        plt.show()
-
-    def show_grad_output(self):
-        im = self.renderer.grad_output.as_numpy().reshape((presenter.height, presenter.width, 3))
-        # im = np.sum(im, axis=2)
-        plt.imshow(im*0.5+0.5)
-        plt.show()
-
-    def show_grad_input(self):
-        im = self.renderer.grad_input.as_numpy().reshape((512, 512, 3))
-        # im = np.sum(im, axis=2)
-        plt.imshow(im*0.5+0.5)
-        plt.show()
-
-
-model = MyModule(create_scene(presenter, True), camera)
+model = TrainableTexture(presenter, create_scene(presenter, True), camera)
 
 def visualize_model(model, number_of_passes = 1):
     final_output = torch.zeros(presenter.width*presenter.height*3)

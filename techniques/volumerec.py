@@ -19,11 +19,11 @@ class TransmittanceGenerator(Technique):
     def __setup__(self):
         # rays
         self.rays = self.create_buffer(6 * 4 * self.width * self.height,
-                                       BufferUsage.STORAGE,
+                                       BufferUsage.STORAGE | BufferUsage.TRANSFER_SRC | BufferUsage.TRANSFER_DST,
                                        MemoryProperty.GPU)
         # Transmittance
         self.transmittances = self.create_buffer(3 * 4 * self.width * self.height,
-                                                 BufferUsage.STORAGE,
+                                                 BufferUsage.STORAGE | BufferUsage.TRANSFER_SRC | BufferUsage.TRANSFER_DST,
                                                  MemoryProperty.GPU)
         # camera buffer
         self.camera_buffer = self.create_uniform_buffer(
@@ -68,11 +68,11 @@ class TransmittanceGenerator(Technique):
 
 
 class TransmittanceForward(Technique):
-    def __init__(self, grid_dim, grid, rays, transmittances):
+    def __init__(self, rays, grid_dim, grid, transmittances):
         super().__init__()
-        self.transmittances = transmittances
-        self.rays = rays
-        self.grid = grid
+        self.rays = rays  # input
+        self.grid = grid  # params
+        self.transmittances = transmittances  # output
         self.grid_dim = grid_dim
 
     def set_medium(self, scattering_albedo: glm.vec3, density: float, phase_g: float):
@@ -113,85 +113,90 @@ class TransmittanceForward(Technique):
             man.dispatch_threads_1D(ray_count)
 
 
-class VolRecForward(Technique):
-    def __init__(self, rays, input_parameters, output_transmittance, shader_folder):
+class TransmittanceBackward(Technique):
+    def __init__(self, rays, grid_dim, gradient_densities, transmittances, gradient_transmittances):
         super().__init__()
+        self.grid_dim = grid_dim
         self.rays = rays  # buffer with rays configurations (origin, direction)
-        self.input_parameters = input_parameters  # Flatten grid 512x512x512 used as parameters
-        self.output_transmittance = output_transmittance  # Float with transmittance for each ray
-        self.shader_folder = shader_folder
+        self.gradient_densities = gradient_densities  # Flatten grid 512x512x512 used as parameters
+        self.transmittances = transmittances  # Float with transmittance for each ray
+        self.gradient_transmittances = gradient_transmittances
         self.pipeline = None
 
+    def set_medium(self, scattering_albedo: glm.vec3, density: float, phase_g: float):
+        self.medium_buffer.scatteringAlbedo = scattering_albedo
+        self.medium_buffer.density = density
+        self.medium_buffer.phase_g = phase_g
+
     def __setup__(self):
-        # create pipeline
+        # medium properties
+        self.medium_buffer = self.create_uniform_buffer(
+            scatteringAlbedo=glm.vec3,
+            density=float,
+            phase_g=float
+        )
         pipeline = self.create_compute_pipeline()
-        pipeline.load_compute_shader(self.shader_folder+'/forward.comp.spv')
-        pipeline.descriptor_set(0)
-        pipeline.bind_scene_ads(0, ShaderStage.RT_GENERATION, lambda: self.scene.scene_ads)
-        pipeline.bind_storage_buffer(1, ShaderStage.RT_GENERATION, lambda: self.output_image)
-        pipeline.bind_uniform(2, ShaderStage.RT_GENERATION, lambda: self.camera_uniform)
-        pipeline.bind_constants(0, ShaderStage.RT_GENERATION,
-            # Fields
-            frame_seed=int,
-            number_of_samples=int
-        )
-        pipeline.descriptor_set(1)
-        pipeline.sampler = self.create_sampler_linear()
-        pipeline.bind_storage_buffer(0, ShaderStage.RT_CLOSEST_HIT, lambda: self.scene.vertices)
-        pipeline.bind_storage_buffer(1, ShaderStage.RT_CLOSEST_HIT, lambda: self.scene.indices)
-        pipeline.bind_storage_buffer(2, ShaderStage.RT_CLOSEST_HIT, lambda: self.scene.transforms)
-        pipeline.bind_storage_buffer(3, ShaderStage.RT_CLOSEST_HIT, lambda: self.scene.material_buffer)
-        pipeline.bind_storage_buffer(4, ShaderStage.RT_CLOSEST_HIT, lambda: self.scene.geometry_descriptions)
-        pipeline.bind_storage_buffer(5, ShaderStage.RT_CLOSEST_HIT, lambda: self.scene.instance_descriptions)
-        pipeline.bind_texture_combined_array(6, ShaderStage.RT_CLOSEST_HIT, -1, lambda: [
-            (texture, pipeline.sampler) for texture in self.scene.textures
-        ])
-        pipeline.descriptor_set(2)
-        pipeline.bind_storage_buffer(0, ShaderStage.RT_CLOSEST_HIT, lambda: self.input_parameters)
+        pipeline.load_compute_shader(__VOLUME_RECONSTRUCTION_SHADERS__ + '/backward.comp.spv')
+        pipeline.bind_storage_buffer(0, ShaderStage.COMPUTE, lambda: self.gradient_densities)
+        pipeline.bind_storage_buffer(1, ShaderStage.COMPUTE, lambda: self.rays)
+        pipeline.bind_storage_buffer(2, ShaderStage.COMPUTE, lambda: self.transmittances)
+        pipeline.bind_storage_buffer(3, ShaderStage.COMPUTE, lambda: self.gradient_transmittances)
+        pipeline.bind_uniform(4, ShaderStage.COMPUTE, lambda: self.medium_buffer)
+        pipeline.bind_constants(0, ShaderStage.COMPUTE,
+                                grid_dim=glm.ivec3,
+                                number_of_rays=int
+                                )
         pipeline.close()
-        # create program
-        program = pipeline.create_rt_program(1, 1)
-        program.set_generation(gen_group)
-        program.set_hit_group(0, hit_group)
-        program.set_miss(0, miss_group)
-        # create uniforms
-        self.camera_uniform = self.create_uniform_buffer(
-            BufferUsage.UNIFORM | BufferUsage.TRANSFER_DST,
-            MemoryProperty.GPU,
-            # fields
-            proj2world=glm.mat4x4
-        )
-        self.update_camera(Camera())
         self.pipeline = pipeline
-        self.program = program
-
-    def update_camera(self, camera):
-        self.camera = camera
-        self.camera_is_dirty = True
-        view, proj = self.camera.build_matrices(self.image_width, self.image_height)
-        world_2_proj = proj * view
-        proj_2_world = glm.inverse(world_2_proj)
-        self.camera_uniform.proj2world = proj_2_world
-
-    def _update_uniforms(self, man: RaytracingManager):
-        # Update necessary buffers
-        if self.camera_is_dirty:
-            man.cpu_to_gpu(self.camera_uniform)
+        self.set_medium(glm.vec3(1, 1, 1), 10, 0.875)
 
     def __dispatch__(self):
-        with self.get_raytracing() as man:
-            man.clear_buffer(self.output_image, 0)  # Clear accumulator image
-            self._update_uniforms(man)
-            # Set pipeline
+        with self.get_compute() as man:
+            man.clear_buffer(self.gradient_densities)  # Zero grad
             man.set_pipeline(self.pipeline)
-            man.update_sets(0, 1, 2)
-            for _ in range(self.number_of_samples):
-                man.update_constants(
-                    ShaderStage.RT_GENERATION,
-                    frame_seed=self.rnd.randint(0, 10000000),
-                    number_of_samples=self.number_of_samples
-                )
-                # dispatch rays
-                man.dispatch_rays(self.program, self.image_width, self.image_height)
-            # clear all dirty flags
-            self.camera_is_dirty = False
+            man.update_sets(0)
+            ray_count = self.rays.size // (4 * 3 * 2)
+            man.update_constants(ShaderStage.COMPUTE,
+                                 grid_dim=self.grid_dim,
+                                 number_of_rays=ray_count
+                                 )
+            man.dispatch_threads_1D(ray_count)
+
+
+class UpSampleGrid(Technique):
+    def __init__(self):
+        self.src_grid = None
+        self.dst_grid = None
+        self.src_grid_dim = glm.ivec3(0,0,0)
+        self.dst_grid_dim = glm.ivec3(0,0,0)
+
+    def set_src_grid(self, grid_dim, grid):
+        self.src_grid = grid
+        self.src_grid_dim = grid_dim
+
+    def set_dst_grid(self, grid_dim, grid):
+        self.dst_grid = grid
+        self.dst_grid_dim = grid_dim
+
+    def __setup__(self):
+        pipeline = self.create_compute_pipeline()
+        pipeline.load_compute_shader(__VOLUME_RECONSTRUCTION_SHADERS__+"/initialize.comp.spv")
+        pipeline.bind_storage_buffer(0, ShaderStage.COMPUTE, lambda: self.dst_grid)
+        pipeline.bind_storage_buffer(1, ShaderStage.COMPUTE, lambda: self.src_grid)
+        pipeline.bind_constants(0, ShaderStage.COMPUTE,
+            dst_grid_dim=glm.ivec3, rem0=float,
+            src_grid_dim=glm.ivec3, rem1=float
+        )
+        pipeline.close()
+        self.pipeline = pipeline
+
+    def __dispatch__(self):
+        with self.get_compute() as man:
+            man.set_pipeline(self.pipeline)
+            man.update_sets(0)
+            man.update_constants(ShaderStage.COMPUTE,
+                dst_grid_dim=self.dst_grid_dim,
+                src_grid_dim=self.src_grid_dim
+            )
+            man.dispatch_threads_1D(self.dst_grid_dim.x * self.dst_grid_dim.y * self.dst_grid_dim.z)
+            man.gpu_to_cpu(self.dst_grid)
