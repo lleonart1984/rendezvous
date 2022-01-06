@@ -70,6 +70,7 @@ class BufferUsage(IntFlag):
     STORAGE = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
     TRANSFER_SRC = VK_BUFFER_USAGE_TRANSFER_SRC_BIT
     TRANSFER_DST = VK_BUFFER_USAGE_TRANSFER_DST_BIT
+    GPU_ADDRESS = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
     RAYTRACING_ADS = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR
     RAYTRACING_ADS_READ = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
 
@@ -272,6 +273,7 @@ class Buffer(Resource):
     def __init__(self, device, w_buffer: vkw.ResourceWrapper):
         super().__init__(device, w_buffer)
         self.size = w_buffer.current_slice["size"]
+        self.gpu_tensor = None  # cached tensor on the gpu
 
     def slice(self, offset, size):
         return Buffer(self.device, self.w_resource.slice_buffer(offset, size))
@@ -284,6 +286,18 @@ class Buffer(Resource):
         with self.device.get_compute() as man:
             man.cpu_to_gpu(self)
 
+    def _prepare_tensor(self, tensor):
+        # TODO: STUPID OF ME NOT KNOWING WHAT IS BEHIND THIS BEHAVIOUR
+        dim = len(tensor.shape)
+        with torch.no_grad():
+            tensor[tuple([0]*dim)] = tensor[tuple([0]*dim)].item()
+
+    def write_gpu_tensor(self, tensor):
+        # self._resolve_gpu_tensor()
+        self.gpu_tensor = tensor.detach().flatten() #.copy_(tensor.reshape(self.gpu_tensor.shape))
+        self.gpu_tensor[0] = self.gpu_tensor[0].item()
+        self.device.copy_gpu_pointer_to_buffer(self.gpu_tensor.storage().data_ptr(), self)
+
     def read(self, data):
         self.w_resource.read(data)
 
@@ -291,6 +305,11 @@ class Buffer(Resource):
         with self.device.get_compute() as man:
             man.gpu_to_cpu(self)
         self.read(data)
+
+    def read_gpu_tensor(self, tensor):
+        self._resolve_gpu_tensor()
+        self.device.copy_buffer_to_gpu_pointer(self.gpu_tensor.storage().data_ptr(), self)
+        tensor.copy_(self.gpu_tensor.reshape(tensor.shape))
 
     def structured(self, **fields):
         layout, size = Uniform.process_layout(fields)
@@ -307,17 +326,25 @@ class Buffer(Resource):
         tensor.inner_vk_resource = self
         return tensor
 
-    def create_gpu_tensor(self):
-        tensor = torch.zeros(self.size // 4).to(torch.device('cuda:0'))
-        self.device.copy_buffer_to_gpu_pointer(tensor.data_ptr(), self, self.size)
-        return tensor
+    def _resolve_gpu_tensor(self):
+        if self.gpu_tensor is None:
+            self.gpu_tensor = torch.zeros(self.size//4).to(torch.device('cuda:0'))
+            self.gpu_tensor[0] = 0.0
+            # self._prepare_tensor(self.gpu_tensor)
+
+    def as_gpu_tensor(self):
+        self._resolve_gpu_tensor()
+        self.device.copy_buffer_to_gpu_pointer(self.gpu_tensor.storage().data_ptr(), self)
+        return self.gpu_tensor
 
     def __str__(self):
-        gpu_tensor = self.create_gpu_tensor()
+        gpu_tensor = self.as_gpu_tensor()
         return str(gpu_tensor)+'\n'+str(gpu_tensor.min())+'\n'+str(gpu_tensor.max())
 
 
 class Uniform(Buffer):
+
+    __SKIP_ATTR__ = {"layout", "w_resource", "size", "device", "gpu_tensor" }
 
     @staticmethod
     def process_layout(fields: Dict[str, type]):
@@ -335,7 +362,7 @@ class Uniform(Buffer):
         w_buffer.get_permanent_map()
 
     def __getattr__(self, item):
-        if item == "layout" or item == "w_resource" or item == "size" or item == "device":
+        if item in Uniform.__SKIP_ATTR__:
             return super(Uniform, self).__getattribute__(item)
         if item not in self.layout:
             return super(Uniform, self).__getattribute__(item)
@@ -345,7 +372,7 @@ class Uniform(Buffer):
         return BinaryFormatter.from_bytes(type, buffer)
 
     def __setattr__(self, item, value):
-        if item == "layout" or item == "w_resource" or item == "size" or item == "device":
+        if item in Uniform.__SKIP_ATTR__:
             super(Uniform, self).__setattr__(item, value)
             return
         if item in self.layout:
@@ -851,12 +878,10 @@ class DeviceManager:
         self.w_state = None
         self.width = 0
         self.height = 0
-        self.__copying_from_gpu_pipeline = None
-        self.__copying_to_gpu_pipeline = None
+        self.__copying_on_the_gpu = None
 
     def __del__(self):
-        self.__copying_to_gpu_pipeline = None
-        self.__copying_from_gpu_pipeline = None
+        self.__copying_on_the_gpu = None
         self.w_device = None
 
     def __bind__(self, w_device: vkw.DeviceWrapper):
@@ -1056,55 +1081,34 @@ class DeviceManager:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.flush()
 
-    def copy_gpu_pointer_to_buffer(self, gpu_pointer, buffer, size):
-        if not self.__copying_from_gpu_pipeline:
-            # Create pipeline to copy gpu pointer
+    def copy_on_the_gpu(self, src_ptr, dst_ptr, size):
+        if self.__copying_on_the_gpu is None:
             pipeline = self.create_compute_pipeline()
-            pipeline.bind_storage_buffer(0, ShaderStage.COMPUTE, lambda: self.__copying_from_gpu_pipeline.buffer)
             pipeline.bind_constants(
                 0, ShaderStage.COMPUTE,
-                pointer=glm.uint64,
-                size=int
+                src_pointer=glm.uint64,
+                dst_pointer=glm.uint64,
+                size=int,
+                pad0=glm.ivec3
             )
-            pipeline.load_compute_shader(__SHADERS_TOOLS__+"/copy_from_gpu_pointer.comp.spv")
+            pipeline.load_compute_shader(__SHADERS_TOOLS__ + "/copy_gpu_pointer.comp.spv")
             pipeline.close()
-            self.__copying_from_gpu_pipeline = pipeline
-
-        self.__copying_from_gpu_pipeline.buffer = buffer
+            self.__copying_on_the_gpu = pipeline
         with self.get_compute() as man:
-            man.set_pipeline(self.__copying_from_gpu_pipeline)
-            man.update_sets(0)
+            man.set_pipeline(self.__copying_on_the_gpu)
             man.update_constants(
                 ShaderStage.COMPUTE,
-                pointer=glm.uint64(gpu_pointer),
+                src_pointer=glm.uint64(src_ptr),
+                dst_pointer=glm.uint64(dst_ptr),
                 size=size
             )
-            man.dispatch_threads_1D(int(math.ceil(size/(4*128))))
-        self.flush()
+            man.dispatch_threads_1D(int(math.ceil((size//4)/128)))
 
-    def copy_buffer_to_gpu_pointer(self, gpu_pointer, buffer, size):
-        if not self.__copying_to_gpu_pipeline:
-            # Create pipeline to copy gpu pointer
-            pipeline = self.create_compute_pipeline()
-            pipeline.bind_storage_buffer(0, ShaderStage.COMPUTE, lambda: self.__copying_to_gpu_pipeline.buffer)
-            pipeline.bind_constants(
-                0, ShaderStage.COMPUTE,
-                pointer=glm.uint64,
-                size=int
-            )
-            pipeline.load_compute_shader(__SHADERS_TOOLS__+"/copy_to_gpu_pointer.comp.spv")
-            pipeline.close()
-            self.__copying_to_gpu_pipeline = pipeline
-        self.__copying_to_gpu_pipeline.buffer = buffer
-        with self.get_compute() as man:
-            man.set_pipeline(self.__copying_to_gpu_pipeline)
-            man.update_sets(0)
-            man.update_constants(
-                ShaderStage.COMPUTE,
-                pointer=glm.uint64(gpu_pointer),
-                size=size
-            )
-            man.dispatch_threads_1D(int(math.ceil(size/(4*128))))
+    def copy_gpu_pointer_to_buffer(self, gpu_pointer, buffer):
+        self.copy_on_the_gpu(gpu_pointer, self.w_device.get_buffer_gpu_ptr(buffer.w_resource), buffer.size)
+
+    def copy_buffer_to_gpu_pointer(self, gpu_pointer, buffer):
+        self.copy_on_the_gpu(self.w_device.get_buffer_gpu_ptr(buffer.w_resource), gpu_pointer, buffer.size)
 
 
 class Presenter(DeviceManager):

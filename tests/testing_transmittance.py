@@ -12,17 +12,98 @@ image_height = 512
 
 presenter = create_presenter(width=image_width, height=image_height, format=Format.VEC4, mode=PresenterMode.OFFLINE,
                              usage=ImageUsage.STORAGE | ImageUsage.TRANSFER_SRC,
-                             debug=True)
+                             debug=False)
 tools = GridTools(presenter)
 
+used_device = torch.device('cuda:0')
+# used_device = torch.device('cpu')
+
 # load grid
-grid = tools.load_file('C:/Users/mendez/Desktop/clouds/disney_big.xyz', usage=ImageUsage.STORAGE | ImageUsage.TRANSFER_SRC | ImageUsage.TRANSFER_DST)
-# flatten_grid, _ = tools.load_file_fatten('C:/Users/mendez/Desktop/clouds/disney_big.xyz', usage=ImageUsage.STORAGE | ImageUsage.TRANSFER_SRC | ImageUsage.TRANSFER_DST)
+grid = torch.Tensor(tools.load_file_as_numpy('C:/Users/mendez/Desktop/clouds/disney_big.xyz')).to(used_device)
 
 print("[INFO] Loaded grid")
 
+image_width = 512
+image_height = 512
 
-torch_device = torch.device('cuda:0')
+ray_generator = RayGenerator(presenter, (image_width, image_height), 0).to(used_device)
+transmittance_module = TransmittanceRenderer(presenter)
+transmittance_module.set_medium(vec3(1,1,1), 10, 0.875)
+
+dataset = []
+cameras = [
+    glm.rotate(i*360/7, vec3(0,1,0))*vec3(1, 0, 0) for i in range(7)
+] + [glm.vec3(0.1, 1, 0.2), glm.vec3(-0.2,-1, 0.1)]
+
+for c in cameras:
+    ray_generator.origin[:] = torch.Tensor( [c.x, c.y, c.z] )
+    ray_generator.target[:] = torch.Tensor( [0, 0, 0] )
+    rays = ray_generator()  # generate rays batch
+    transmittances = transmittance_module(rays, grid)
+    dataset.append((rays.detach().clone(), transmittances.detach().clone()))
+
+# Check transmittances
+for r, t in dataset:
+    plt.imshow(t.reshape((image_width, image_height, 3)).cpu().numpy())
+    plt.show()
+
+class TrainableCloud(nn.Module):
+    def __init__(self, device, grid_dim):
+        super().__init__()
+        self.Grid = nn.Parameter(torch.zeros(*grid_dim))
+        self.transmittance_renderer = TransmittanceRenderer(device)
+
+    def set_medium(self, scattering_albedo: glm.vec3, density: float, phase_g: float):
+        self.transmittance_renderer.set_medium(scattering_albedo, density, phase_g)
+
+    def forward(self, *args):
+        rays, = args
+        return self.transmittance_renderer(rays, torch.clamp(self.Grid, 0.0, 1.0))
+
+
+rec_grid_size = 128
+
+model = TrainableCloud(presenter, (rec_grid_size, rec_grid_size, rec_grid_size)).to(used_device)
+model.set_medium(vec3(1,1,1), 10, 0.875)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=0.05)
+scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, 0.999)
+num_epochs = 300
+for epoch in range(0, num_epochs):
+    optimizer.zero_grad()
+    for i, (rays, transmittances) in enumerate(dataset):
+        output = model(rays)
+        if i == 0:
+            # loss = torch.abs(output - transmittances).sum()
+            loss = torch.nn.functional.mse_loss(output, transmittances)
+        else:
+            # loss = loss + torch.abs(output - transmittances).sum()
+            loss += torch.nn.functional.mse_loss(output, transmittances)
+        if epoch == num_epochs-1:
+            plt.imshow(output.detach().cpu().reshape((image_width, image_height, 3)).numpy())
+            plt.show()
+    loss.backward()
+    optimizer.step()
+    if epoch == 0 or (epoch + 1) % 50 == 0:
+        print(loss.item())
+    scheduler.step()
+
+# show final reconstruction
+g = torch.clamp(model.Grid, 0.0, 1.0).detach().cpu().numpy()
+plt.imshow(g[:,:,rec_grid_size//2].T, vmin=0, vmax=1)
+plt.show()
+plt.imshow(g[:,rec_grid_size//2,:].T, vmin=0, vmax=1)
+plt.show()
+plt.imshow(g[rec_grid_size//2,:,:], vmin=0, vmax=1)
+plt.show()
+
+# clean objects
+ray_generator = None
+transmittance_module = None
+presenter = None
+
+exit()
+
 
 # Generating dataset
 dataset = []
@@ -51,23 +132,21 @@ for c in cameras:
 print("[INFO] Loaded datasets")
 
 
-# create Trainable rendering
-class TrainableGrid(RendererModule):
+# create differentiable transmittance
+class DifferentiableTransmittance(RendererModule):
     def __init__(self, device: DeviceManager, grid_dim, output_dim):
-        self.grid_dim = grid_dim
-        self.output_dim = output_dim
         super().__init__(
             device,
-            [output_dim.x * output_dim.y * 6], # input rays, one for each output transmittance
-            [grid_dim.x*grid_dim.y*grid_dim.z],  # parameters for the grid to reconstruct
-            [output_dim.x*output_dim.y*3],  # output values for the image rendered
-            input_trainable=False  # input is not backprop
+            2,  # two inputs, rays and grid densities
+            1   # one output, the transmittances
         )
-        self.P = self.get_param_tensor()
+        self.grid_dim = grid_dim   # dimension of the grid.
+        self.output_dim = output_dim  # dimension used to create the output tensor.
+        self.Grid = nn.Parameter(torch.zeros(grid_dim), requires_grad=True)
 
     def setup(self):
         self.forward_technique = TransmittanceForward(
-            self.get_input(),
+            self.get_input(0),
             self.grid_dim,
             self.get_param(),
             self.get_output()

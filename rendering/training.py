@@ -14,210 +14,199 @@ class RendererModule(nn.Module):
     """
     def __init__(self,
                  device: DeviceManager,
-                 input_sizes,
-                 params_sizes,
-                 output_sizes,
-                 input_trainable=None,
+                 input_args: int,
+                 output_args: int,
                  *args, **kwargs):
         """ Initializes the render module using description for input tensors, parameters and outputs
         """
         super().__init__()
         self.device = device
-        self.input_sizes = input_sizes
-        self.input_trainable = [True]*len(input_sizes) if input_trainable is None or input_trainable is True else \
-            [False]*len(input_sizes) if input_trainable is False else input_trainable
-        self.params_sizes = params_sizes
-        self.output_sizes = output_sizes
-        self.input_len = len(input_sizes)
-        self.params_len = len(params_sizes)
-        self.inputs = []
-        self.grad_inputs = []
-        for size, trainable in zip(self.input_sizes, self.input_trainable):
-            self.inputs.append(device.create_buffer(
-                size=size * 4,  # assuming all floats
-                usage=BufferUsage.STORAGE | BufferUsage.TRANSFER_DST | BufferUsage.TRANSFER_SRC,
-                memory=MemoryProperty.GPU
-            ))
-            if trainable:
-                self.grad_inputs.append(device.create_buffer(
-                    size=size * 4,  # assuming all floats
-                    usage=BufferUsage.STORAGE | BufferUsage.TRANSFER_DST | BufferUsage.TRANSFER_SRC,
-                    memory=MemoryProperty.GPU
-                ))
-            else:
-                self.grad_inputs.append(None)
-        self.params = []
-        self.grad_params = []
-        for size in self.params_sizes:
-            self.params.append(device.create_buffer(
-                size=size * 4,  # assuming all floats
-                usage=BufferUsage.STORAGE | BufferUsage.TRANSFER_DST | BufferUsage.TRANSFER_SRC,
-                memory=MemoryProperty.GPU
-            ))
-            self.grad_params.append(device.create_buffer(
-                size=size * 4,  # assuming all floats
-                usage=BufferUsage.STORAGE | BufferUsage.TRANSFER_DST | BufferUsage.TRANSFER_SRC,
-                memory=MemoryProperty.GPU
-            ))
-        self.params_modules = nn.ParameterList(nn.Parameter(torch.zeros(p.size//4)) for p in self.params)
-        self.outputs = []
-        self.grad_outputs = []
-        for size in self.output_sizes:
-            self.outputs.append(device.create_buffer(
-                size=size * 4,  # assuming all floats
-                usage=BufferUsage.STORAGE | BufferUsage.TRANSFER_DST | BufferUsage.TRANSFER_SRC,
-                memory=MemoryProperty.GPU
-            ))
-            self.grad_outputs.append(
-                device.create_buffer(
-                    size=size * 4,  # assuming all floats
-                    usage=BufferUsage.STORAGE | BufferUsage.TRANSFER_DST | BufferUsage.TRANSFER_SRC,
-                    memory=MemoryProperty.GPU
-                ))
+        self.input_buffers = [None] * input_args
+        self.input_grad_buffers = [None] * input_args
+        self.output_buffers = [None] * output_args
+        self.output_grad_buffers = [None] * output_args
+        self.cached_buffers = { }
         self.setup()
 
     def get_input(self, index = 0):
-        return self.inputs[index]
+        return self.input_buffers[index]
 
     def get_input_gradient(self, index = 0):
-        return self.grad_inputs[index]
-
-    def get_param(self, index = 0):
-        return self.params[index]
-
-    def get_param_tensor(self, index = 0):
-        return self.params_modules[index]
-
-    def get_param_gradient(self, index = 0):
-        return self.grad_params[index]
+        return self.input_grad_buffers[index]
 
     def get_output(self, index = 0):
-        return self.outputs[index]
+        return self.output_buffers[index]
 
     def get_output_gradient(self, index = 0):
-        return self.grad_outputs[index]
+        return self.output_grad_buffers[index]
 
-    def setup(self):
+    def create_output_tensors(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
         """
-        Creates resources, techniques necessary for rendering process
+        When implemented creates the tensors for the output
         """
         pass
 
-    def forward_render(self):
+    def _resolve_buffer(self, required_size):
+        if required_size == 0:
+            return None
+        if required_size not in self.cached_buffers:
+            self.cached_buffers[required_size] = []
+        if len(self.cached_buffers[required_size]) == 0:
+            buffer = self.device.create_buffer(
+                required_size,
+                BufferUsage.GPU_ADDRESS | BufferUsage.STORAGE | BufferUsage.TRANSFER_SRC | BufferUsage.TRANSFER_DST,
+                MemoryProperty.GPU
+            )
+            self.cached_buffers[required_size].append(buffer)
+        return self.cached_buffers[required_size].pop()
+
+    def resolve_inputs(self, sizes):
+        assert len(sizes) == len(self.input_buffers), "Incorrect number of input tensors"
+        self.input_buffers = [self._resolve_buffer(size) for size in sizes]
+
+    def resolve_input_gradients(self, sizes):
+        assert len(sizes) == len(self.input_grad_buffers), "Incorrect number of input tensors"
+        self.input_grad_buffers = [self._resolve_buffer(size) for size in sizes]
+
+    def resolve_outputs(self, sizes):
+        assert len(sizes) == len(self.output_buffers), "Incorrect number of input tensors"
+        self.output_buffers = [self._resolve_buffer(size) for size in sizes]
+
+    def resolve_output_gradients(self, sizes):
+        assert len(sizes) == len(self.output_grad_buffers), "Incorrect number of input tensors"
+        self.output_grad_buffers = [self._resolve_buffer(size) for size in sizes]
+
+    def free_buffers(self):
+        for b in self.input_buffers + self.input_grad_buffers + self.output_buffers + self.output_grad_buffers:
+            if b:
+                self.cached_buffers[b.size].append(b)
+
+    def setup(self):
+        """
+        Creates resources, techniques necessary for rendering process.
+        Pipeline should bind buffers provided by get_input, get_input_gradient, get_output and get_output_gradient.
+        Those buffers will be created/updated with input tensors and backprop gradients
+        """
+        pass
+
+    def forward_render(self, input_shapes, output_shapes):
         """
         Computes the output given the parameters
         """
         pass
 
-    def backward_render(self):
+    def backward_render(self, input_shapes, output_shapes):
         """
         Computes the gradient of parameters given the gradients of outputs and the original inputs
         """
         pass
 
-    def forward_params(self):
-        """
-        If overriden, allows to manipulate the list of parameters before forward, for instance, clamping or mapping
-        """
-        return list(self.params_modules)
-
     def forward(self, *args):
-        outputs = TrainableRendererFunction.apply(*(list(args) + self.forward_params() + [self]))
+        outputs = TrainableRendererFunction.apply(*(list(args) + [self]))
         return outputs[0] if len(outputs) == 1 else outputs
+
+
+# class ParamsRendererModule(RendererModule):
+#     def create_params(self) -> List[torch.Tensor]:
+#         pass
+#
+#     def __init__(self,
+#                  device: DeviceManager,
+#                  input_args: int,
+#                  output_args: int,
+#                  *args, **kwargs):
+#         params = self.create_params()
+#         super().__init__(device, input_args + len(params), output_args, *args, **kwargs)
+#         self.params_module = nn.ParameterList(nn.Parameter(t) for t in params)
+#
+#     def get_param_tensor(self, index: int = 0):
+#         return self.params_module[index]
+#
+#     def forward(self, *args):
+#         return super().forward(*(list(args) + list(self.params_module)))
 
 
 class TrainableRendererFunction(torch.autograd.Function):
 
     @staticmethod
-    def copy_tensor_to_buffer(tensor, buffer, cpu=True):
+    def copy_tensor_to_buffer(tensor: torch.Tensor, buffer: Buffer, cpu=True):
+        assert torch.numel(tensor)*4 == buffer.size, "Tensor and buffer have different sizes!"
         if cpu:
             buffer.write_direct(tensor)
         else:
-            buffer.device.copy_gpu_pointer_to_buffer(tensor.data_ptr(), buffer, buffer.size)
-        # device: DeviceManager = renderer.device
-        # buffer.write_direct(tensor.to(torch.device('cpu')))
+            buffer.write_gpu_tensor(tensor)
+            # Check
+            # check = torch.zeros_like(tensor, device=torch.device('cpu'))
+            # buffer.read_direct(check)
+            # difference = (check - tensor.to(torch.device('cpu'))).sum()
+            # assert difference.item() == 0, "Tensor couldnt copy correclty to buffer"+str(difference.item())
 
     @staticmethod
-    def create_tensor_from_buffer(buffer, cpu=True):
+    def copy_buffer_to_tensor(tensor, buffer, cpu=True):
+        assert torch.numel(tensor)*4 == buffer.size, "Tensor and buffer have different sizes!"
         if cpu:
-            tensor = torch.zeros(buffer.size // 4)
             buffer.read_direct(tensor)
-            return tensor
         else:
-            return buffer.create_gpu_tensor()
-        # device: DeviceManager = renderer.device
-        # tensor = torch.zeros(buffer.size // 4)
-        # buffer.read_direct(tensor)
-        # tensor = tensor.to(torch_device)
-        # return tensor
+            buffer.read_gpu_tensor(tensor)
+            # Check
+            # check = torch.zeros_like(tensor, device=torch.device('cpu'))
+            # buffer.read_direct(check)
+            # difference = (check - tensor.to(torch.device('cpu'))).sum()
+            # assert difference.item() == 0, "Tensor couldnt copy correclty to buffer"+str(difference.item())
 
-    @staticmethod
-    def resolve_device_for_output(inputs, params):
-        if len(inputs) > 0:
-            return inputs[0].device
-        if len(params) > 0:
-            return params[0].device
-        return torch.device('cpu')
 
     @staticmethod
     def forward(ctx, *args):
-        """
-        In the forward pass we receive a Tensor containing the input and return
-        a Tensor containing the output. ctx is a context object that can be used
-        to stash information for backward computation. You can cache arbitrary
-        objects for use in the backward pass using the ctx.save_for_backward method.
-        """
         renderer: RendererModule
         args = list(args)
         renderer = args[-1]
-        inputs = args[0:renderer.input_len]
-        params = args[renderer.input_len: renderer.input_len + renderer.params_len]
-        torch_device = TrainableRendererFunction.resolve_device_for_output(inputs, params)
-        ctx.save_for_backward(*args[0:-1])
+        inputs = args[0:-1]
+        outputs = renderer.create_output_tensors(inputs)
+        input_shapes = [t.shape for t in inputs]
+        output_shapes = [t.shape for t in outputs]
+        renderer.resolve_inputs([torch.numel(t)*4 for t in inputs])
+        renderer.resolve_outputs([torch.numel(t)*4 for t in outputs])
         ctx.renderer = renderer
         ctx.devices = [t.device == torch.device('cpu') for t in inputs], \
-                      [t.device == torch.device('cpu') for t in params], \
-                      torch_device == torch.device('cpu')
-        for i, i_b in zip(inputs, renderer.inputs):
+                      [t.device == torch.device('cpu') for t in outputs]
+        for i, i_b in zip(inputs, renderer.input_buffers):
             TrainableRendererFunction.copy_tensor_to_buffer(i, i_b, i.device == torch.device('cpu'))
-        for p, p_b in zip(params, renderer.params):
-            TrainableRendererFunction.copy_tensor_to_buffer(p, p_b, p.device == torch.device('cpu'))
-        renderer.forward_render()
-        outputs = [
-            TrainableRendererFunction.create_tensor_from_buffer(o_b, torch_device == torch.device('cpu'))
-            for o_b in renderer.outputs
-        ]
+        renderer.forward_render(input_shapes, output_shapes)
+        for o, o_b in zip(outputs, renderer.output_buffers):
+            TrainableRendererFunction.copy_buffer_to_tensor(o, o_b, o.device == torch.device('cpu'))
+        ctx.save_for_backward(*(args[0:-1] + [o.detach().clone() for o in outputs]))
+        renderer.free_buffers()
         return tuple(outputs)
 
     @staticmethod
     def backward(ctx, *args):
-        """
-        In the backward pass we receive a Tensor containing the gradient of the loss
-        with respect to the output, and we need to compute the gradient of the loss
-        with respect to the input.
-        """
-        grad_outputs = list(args)
         saved_tensors = list(ctx.saved_tensors)
         renderer = ctx.renderer
-        input_devices, params_devices, output_devices = ctx.devices
-        inputs = saved_tensors[0:renderer.input_len]
-        params = saved_tensors[renderer.input_len:renderer.input_len + renderer.params_len]
-        for i, i_b, dev in zip(inputs, renderer.inputs, input_devices):
+        inputs = saved_tensors[0:len(renderer.input_buffers)] # get saved input tensors
+        outputs = saved_tensors[len(renderer.input_buffers):] # get saved output tensors
+        grad_outputs = list(args) # get output gradients
+
+        # import matplotlib.pyplot as plt
+        # plt.imshow(args[0].detach().reshape(16,16,3).sum(dim=-1).cpu().numpy(), vmin=-10, vmax=10)
+        # plt.show()
+
+        grad_inputs = [None if not i.requires_grad else torch.zeros_like(i) for i in inputs] # create input gradients
+        input_devices, output_devices = ctx.devices
+        input_shapes = [t.shape for t in inputs]
+        output_shapes = [t.shape for t in outputs]
+        renderer.resolve_inputs([torch.numel(t)*4 for t in inputs])
+        renderer.resolve_input_gradients([0 if not t.requires_grad else torch.numel(t)*4 for t in inputs])  # gradients has same dimensions
+        renderer.resolve_outputs([torch.numel(t)*4 for t in outputs])
+        renderer.resolve_output_gradients([torch.numel(t)*4 for t in grad_outputs])
+        for i, i_b, dev in zip(inputs, renderer.input_buffers, input_devices):
             TrainableRendererFunction.copy_tensor_to_buffer(i, i_b, dev)
-        for p, p_b, dev in zip(params, renderer.params, params_devices):
-            TrainableRendererFunction.copy_tensor_to_buffer(p, p_b, dev)
-        for go, go_b in zip(grad_outputs, renderer.grad_outputs):
-            TrainableRendererFunction.copy_tensor_to_buffer(go, go_b, output_devices)
-        renderer.backward_render()
-        gradients = []
-        for i, gi, dev in zip(inputs, renderer.grad_inputs, input_devices):
-            gradients.append(
-                None if gi is None else  # for inputs with no gradients
-                TrainableRendererFunction.create_tensor_from_buffer(gi, dev)
-            )
-        for p, gp, dev in zip(params, renderer.grad_params, params_devices):
-            gradients.append(
-                TrainableRendererFunction.create_tensor_from_buffer(gp, dev)
-            )
-        gradients.append(None) # renderer input is not differentiable
-        return tuple(gradients)
+        for o, o_b, dev in zip(outputs, renderer.output_buffers, output_devices):
+            TrainableRendererFunction.copy_tensor_to_buffer(o, o_b, dev)
+        for go, go_b, dev in zip(grad_outputs, renderer.output_grad_buffers, output_devices):
+            TrainableRendererFunction.copy_tensor_to_buffer(go, go_b, dev)
+        renderer.backward_render(input_shapes, output_shapes)
+        for i, gi, gi_b, dev in zip(inputs, grad_inputs, renderer.input_grad_buffers, input_devices):
+            if i.requires_grad:
+                TrainableRendererFunction.copy_buffer_to_tensor(gi, gi_b, dev)
+        renderer.free_buffers()
+        return tuple(grad_inputs + [None])  # append None to refer to renderer object passed in forward

@@ -90,7 +90,7 @@ float RegularGridTransmittance(vec3 x, vec3 w, float total_d, vec3 T, vec3 dL_dT
 
         int voxel_index = cell.x + cell.y * g_dim.x + cell.z * g_dim.x * g_dim.y;
         float dt = next_t - current_t;
-        vec3 dT_dsigma = -T * dt;
+        vec3 dT_dsigma = -vec3(dt);
         vec3 grad_inc = dL_dT * dT_dsigma * g_density;
         atomicAdd(gradients.data[voxel_index], grad_inc.x + grad_inc.y + grad_inc.z);
 

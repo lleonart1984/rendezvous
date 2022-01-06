@@ -497,7 +497,7 @@ class ResourceWrapper:
 
     def write(self, bytes):
         if isinstance(bytes, list):
-            bytes = np.array(bytes)
+            bytes = np.array(bytes, dtype=np.float32())
         if isinstance(bytes, torch.Tensor):
             bytes = bytes.numpy()
         if isinstance(bytes, np.ndarray):  # get buffer from numpy array
@@ -593,6 +593,10 @@ class ResourceWrapper:
         if self.resource_data.is_buffer:
             return (1, 'b')
         return _FORMAT_DESCRIPTION[self.resource_data.vk_description.format]
+
+    def get_gpu_ptr(self):
+        assert self.resource_data.is_buffer, "Can not retrieve pointers from non-buffer objects"
+        return self.resource_data.device.get_buffer_gpu_ptr(self)
 
     @staticmethod
     def get_subresources(slice):
@@ -1175,7 +1179,21 @@ class CommandBufferWrapper:
         self.current_pipeline._update_level(level)
 
     def dispatch_groups(self, dimx, dimy, dimz):
+        vkCmdPipelineBarrier(self.vk_cmdList,
+                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             0, 1, VkMemoryBarrier(
+                srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
+                dstAccessMask=VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT
+            ), 0, 0, 0, 0)
         vkCmdDispatch(self.vk_cmdList, dimx, dimy, dimz)
+        vkCmdPipelineBarrier(self.vk_cmdList,
+                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             0, 1, VkMemoryBarrier(
+                srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
+                dstAccessMask=VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT
+            ), 0, 0, 0, 0)
 
     def _get_strided_device_address(self, w_resource: ResourceWrapper, stride):
         if w_resource is None:
@@ -1327,6 +1345,7 @@ class CommandPoolWrapper:
                     self.attached.remove(m)  # remove from attached
 
         if len(managers) == 0:
+            vkQueueWaitIdle(self.vk_queue)
             return  # finished task
 
         cmdLists = []
@@ -1953,6 +1972,9 @@ class DeviceWrapper:
 
     def create_buffer(self, size, usage, properties, is_ads: bool = False):
         return ResourceWrapper(resource_data=self.create_buffer_data(size, usage, properties, is_ads))
+
+    def get_buffer_gpu_ptr(self, buffer):
+        return self._get_device_address(buffer).deviceAddress
 
     def _get_device_address(self, buffer):
         if buffer is None:

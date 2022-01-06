@@ -1,11 +1,11 @@
 from rendering.manager import *
+from rendering.training import *
 from rendering.scenes import *
 import random
 import os
 
 
 __RBG_SHADERS__ = os.path.dirname(__file__)+"/shaders/RBP"
-
 
 compile_shader_sources(__RBG_SHADERS__)
 

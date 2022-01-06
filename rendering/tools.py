@@ -47,6 +47,16 @@ class GridTools:
 
         return texture
 
+    def load_file_as_numpy(self, path: str):
+        with open(path, 'rb') as f:
+            width, height, depth = struct.unpack('iii', f.read(4*3))
+            resx, resy, resz = struct.unpack('ddd', f.read(8*3))
+            data = np.zeros(shape=(depth, height, width), dtype=np.float32)
+            for x in range(width):
+                for y in range(height):
+                    data[:, y, x] = struct.unpack('f'*depth, f.read(4*depth))
+        return data
+
     def load_file_fatten(self, path: str, mips=1, usage=BufferUsage.TRANSFER_DST | BufferUsage.STORAGE):
         device: DeviceManager = self.device
         with open(path, 'rb') as f:
