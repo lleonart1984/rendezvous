@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 from rendering.tools import *
 from rendering.training import *
 from techniques.volumerec import *
+import torch
 
 
 image_width = 512
@@ -26,31 +27,46 @@ print("[INFO] Loaded grid")
 image_width = 512
 image_height = 512
 
-ray_generator = RayGenerator(presenter, (image_width, image_height), 0).to(used_device)
-transmittance_module = TransmittanceRenderer(presenter)
-transmittance_module.set_medium(vec3(1,1,1), 10, 0.875)
+medium_parameters = { 'scattering_albedo': vec3(1,1,1), 'density': 10, 'phase_g': 0.875 }
 
-dataset = []
+def view_grid(grid, look_position, look_target):
+    ray_generator = RayGenerator(presenter, (image_height, int(image_width*1.4)), 0)
+    rays = ray_generator(torch.Tensor([*look_position]), torch.Tensor([*look_target]))
+    transmittance_module = TransmittanceRenderer(presenter)
+    transmittance_module.set_medium(**medium_parameters)
+    transmittances = transmittance_module(rays, grid)
+    plt.imshow(transmittances.detach().reshape(image_height, int(image_width*1.4), 3).cpu().numpy())
+    plt.show()
+
+
+view_grid(grid, (0.8, 0.1, 0.5), (0,0,0))
+
 cameras = [
     glm.rotate(i*360/7, vec3(0,1,0))*vec3(1, 0, 0) for i in range(7)
 ] + [glm.vec3(0.1, 1, 0.2), glm.vec3(-0.2,-1, 0.1)]
 
-for c in cameras:
-    ray_generator.origin[:] = torch.Tensor( [c.x, c.y, c.z] )
-    ray_generator.target[:] = torch.Tensor( [0, 0, 0] )
-    rays = ray_generator()  # generate rays batch
-    transmittances = transmittance_module(rays, grid)
-    dataset.append((rays.detach().clone(), transmittances.detach().clone()))
+origins = torch.Tensor(np.array([[c.x, c.y, c.z] for c in cameras], dtype=np.float32)).to(used_device)
+targets = torch.zeros_like(origins)
 
-# Check transmittances
-for r, t in dataset:
-    plt.imshow(t.reshape((image_width, image_height, 3)).cpu().numpy())
-    plt.show()
+ray_generator = RayGenerator(presenter, (image_height, image_width), 0).to(used_device)
+
+full_rays = ray_generator(origins, targets)
+
+transmittance_module = TransmittanceRenderer(presenter)
+transmittance_module.set_medium(**medium_parameters)
+
+transmittances = transmittance_module(full_rays, grid)
+
+plt.imshow(transmittances.reshape((len(cameras), image_height, image_width, 3)).cpu().numpy()[0])
+plt.show()
 
 class TrainableCloud(nn.Module):
-    def __init__(self, device, grid_dim):
+    def __init__(self, device, grid_or_dim):
         super().__init__()
-        self.Grid = nn.Parameter(torch.zeros(*grid_dim))
+        if isinstance(grid_or_dim, torch.Tensor):
+            self.Grid = nn.Parameter(grid_or_dim)
+        else:
+            self.Grid = nn.Parameter(torch.zeros(*grid_or_dim))
         self.transmittance_renderer = TransmittanceRenderer(device)
 
     def set_medium(self, scattering_albedo: glm.vec3, density: float, phase_g: float):
@@ -61,46 +77,91 @@ class TrainableCloud(nn.Module):
         return self.transmittance_renderer(rays, torch.clamp(self.Grid, 0.0, 1.0))
 
 
-rec_grid_size = 128
+rec_sizes = []
+rec_size = list(grid.shape)
+while rec_size[0] >= 32 and rec_size[1] >= 32 and rec_size[2] >= 32:
+    rec_sizes.append(list(rec_size))
+    rec_size[0] //= 2
+    rec_size[1] //= 2
+    rec_size[2] //= 2
+list.reverse(rec_sizes)
 
-model = TrainableCloud(presenter, (rec_grid_size, rec_grid_size, rec_grid_size)).to(used_device)
-model.set_medium(vec3(1,1,1), 10, 0.875)
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=0.05)
-scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, 0.999)
-num_epochs = 300
-for epoch in range(0, num_epochs):
-    optimizer.zero_grad()
-    for i, (rays, transmittances) in enumerate(dataset):
-        output = model(rays)
-        if i == 0:
-            # loss = torch.abs(output - transmittances).sum()
-            loss = torch.nn.functional.mse_loss(output, transmittances)
-        else:
-            # loss = loss + torch.abs(output - transmittances).sum()
-            loss += torch.nn.functional.mse_loss(output, transmittances)
-        if epoch == num_epochs-1:
-            plt.imshow(output.detach().cpu().reshape((image_width, image_height, 3)).numpy())
-            plt.show()
-    loss.backward()
-    optimizer.step()
-    if epoch == 0 or (epoch + 1) % 50 == 0:
-        print(loss.item())
-    scheduler.step()
+_time = time.perf_counter()
+
+rec_grid = None
+
+lr = 0.1
+
+for rec_grid_size in rec_sizes:
+    if rec_grid is None:  # first grid
+        rec_grid = torch.zeros(*rec_sizes[0], device=used_device)
+    else:  # get from upsampling
+        upscaling = ResampleGrid(presenter, rec_grid_size)
+        rec_grid = upscaling(rec_grid)
+
+    model = TrainableCloud(presenter, rec_grid)
+    model.set_medium(**medium_parameters)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, 0.99)
+    num_epochs = 20
+    for epoch in range(0, num_epochs):
+        optimizer.zero_grad()
+        output = model(full_rays)
+        # loss = torch.abs(output - transmittances).sum()
+        loss = torch.nn.functional.mse_loss(output, transmittances)
+        loss.backward()
+        optimizer.step()
+        if epoch == 0 or (epoch + 1) % 5 == 0:
+            print(loss.item())
+        scheduler.step()
+    lr = optimizer.param_groups[0]['lr']
+
+_time = time.perf_counter() - _time
+
+print(f"[INFO] Optimization took {_time}s")
+print(f'[INFO] Final lr={lr}')
+
+rec_grid = torch.clamp(rec_grid, 0.0, 1.0).detach().cpu()
+
+view_grid(rec_grid, (0.8, 0.1, 0.5), (0,0,0))
+
+exit()
+
+output = model(full_rays)
+
+plt.imshow(output.detach().cpu().reshape((image_height * len(cameras), image_width, 3)).numpy())
+plt.show()
+
+plt.imshow(transmittances.detach().cpu().reshape((image_height * len(cameras), image_width, 3)).numpy())
+plt.show()
+
+rec_grid_size = rec_grid.shape
 
 # show final reconstruction
-g = torch.clamp(model.Grid, 0.0, 1.0).detach().cpu().numpy()
-plt.imshow(g[:,:,rec_grid_size//2].T, vmin=0, vmax=1)
+g = rec_grid.numpy()
+plt.imshow(g[:,:,rec_grid_size[2]//2].T, vmin=0, vmax=1)
 plt.show()
-plt.imshow(g[:,rec_grid_size//2,:].T, vmin=0, vmax=1)
+plt.imshow(g[:,rec_grid_size[1]//2,:].T, vmin=0, vmax=1)
 plt.show()
-plt.imshow(g[rec_grid_size//2,:,:], vmin=0, vmax=1)
+plt.imshow(g[rec_grid_size[0]//2,:,:], vmin=0, vmax=1)
 plt.show()
 
 # clean objects
 ray_generator = None
 transmittance_module = None
 presenter = None
+exit()
+
+
+
+
+
+
+
+
+
+
 
 exit()
 

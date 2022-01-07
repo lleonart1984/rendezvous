@@ -17,12 +17,7 @@ class RayGenerator(RendererModule):
         self.output_dim = output_dim
         self.mode = mode
         self.camera_buffer = None
-        super().__init__(device, 0, 1, *args, **kwargs)
-        self.origin = nn.Parameter(torch.Tensor([0,0,-2]), requires_grad=False)
-        self.target = nn.Parameter(torch.Tensor([0,0,0]), requires_grad=False)
-
-    def create_output_tensors(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
-        return [torch.zeros((self.output_dim[0]*self.output_dim[1], 6), device=self.origin.device)]
+        super().__init__(device, *args, **kwargs)
 
     def setup(self):
         self.camera_buffer = self.device.create_uniform_buffer(
@@ -30,7 +25,7 @@ class RayGenerator(RendererModule):
         )
         pipeline = self.device.create_compute_pipeline()
         pipeline.load_compute_shader(__VOLUME_RECONSTRUCTION_SHADERS__+"/raygen.comp.spv")
-        pipeline.bind_storage_buffer(0, ShaderStage.COMPUTE, lambda: self.get_output())
+        pipeline.bind_storage_buffer(0, ShaderStage.COMPUTE, lambda: self.pipeline.rays)
         pipeline.bind_uniform(1, ShaderStage.COMPUTE, lambda: self.camera_buffer)
         pipeline.bind_constants(
             0, ShaderStage.COMPUTE,
@@ -41,27 +36,36 @@ class RayGenerator(RendererModule):
         pipeline.close()
         self.pipeline = pipeline
 
-    def forward_render(self, input_shapes, output_shapes):
-        # Setup camera
-        proj = glm.perspective(45, self.output_dim[0] / self.output_dim[1], 0.01, 1000)
-        view = glm.lookAt(glm.vec3(*self.origin), glm.vec3(*self.target), glm.vec3(0, 1, 0))
-        proj_to_model = glm.inverse(proj * view)
-        self.camera_buffer.ProjToWorld = proj_to_model
-        with self.device.get_compute() as man:
-            man.set_pipeline(self.pipeline)
-            man.update_sets(0)
-            man.update_constants(
-                ShaderStage.COMPUTE,
-                dim=glm.ivec2(self.output_dim[0], self.output_dim[1]),
-                mode=self.mode,
-                seed=np.random.randint(0, 10000000)
-            )
-            man.dispatch_threads_2D(self.output_dim[0], self.output_dim[1])
+    def forward_render(self, inputs):
+        origins, targets = inputs
+        origins = origins.reshape(-1, 3)
+        targets = targets.reshape(-1, 3)
+        full_rays = torch.zeros(len(origins) * self.output_dim[0] * self.output_dim[1], 6, device=origins.device)
+        for i, (o, t) in enumerate(zip(origins, targets)):
+            self.pipeline.rays = self.wrap_tensor(torch.zeros(self.output_dim[0] * self.output_dim[1], 6, device=origins.device), False)
+            # Setup camera
+            proj = glm.perspective(45, self.output_dim[1] / self.output_dim[0], 0.01, 1000)
+            view = glm.lookAt(glm.vec3(*o), glm.vec3(*t), glm.vec3(0, 1, 0))
+            proj_to_model = glm.inverse(proj * view)
+            self.camera_buffer.ProjToWorld = proj_to_model
+            with self.device.get_compute() as man:
+                man.set_pipeline(self.pipeline)
+                man.update_sets(0)
+                man.update_constants(
+                    ShaderStage.COMPUTE,
+                    dim=glm.ivec2(self.output_dim[1], self.output_dim[0]),
+                    mode=self.mode,
+                    seed=np.random.randint(0, 10000000)
+                )
+                man.dispatch_threads_2D(self.output_dim[1], self.output_dim[0])
+            t = self.get_tensor(self.pipeline.rays)
+            full_rays[i*self.output_dim[0]*self.output_dim[1]:(i+1)*self.output_dim[0]*self.output_dim[1]] = t
+        return [full_rays]
 
 
 class TransmittanceRenderer(RendererModule):
     def __init__(self, device, *args, **kwargs):
-        super().__init__(device, 2, 1, *args, **kwargs)
+        super().__init__(device, *args, **kwargs)
 
     def setup(self):
         self.medium_buffer = self.device.create_uniform_buffer(
@@ -71,9 +75,9 @@ class TransmittanceRenderer(RendererModule):
         )
         pipeline = self.device.create_compute_pipeline()
         pipeline.load_compute_shader(__VOLUME_RECONSTRUCTION_SHADERS__ + '/forward.comp.spv')
-        pipeline.bind_storage_buffer(0, ShaderStage.COMPUTE, lambda: self.get_input(1))
-        pipeline.bind_storage_buffer(1, ShaderStage.COMPUTE, lambda: self.get_input(0))
-        pipeline.bind_storage_buffer(2, ShaderStage.COMPUTE, lambda: self.get_output())
+        pipeline.bind_storage_buffer(0, ShaderStage.COMPUTE, lambda: self.forward_pipeline.grid)
+        pipeline.bind_storage_buffer(1, ShaderStage.COMPUTE, lambda: self.forward_pipeline.rays)
+        pipeline.bind_storage_buffer(2, ShaderStage.COMPUTE, lambda: self.forward_pipeline.transmittances)
         pipeline.bind_uniform(3, ShaderStage.COMPUTE, lambda: self.medium_buffer)
         pipeline.bind_constants(0, ShaderStage.COMPUTE,
                                 grid_dim=glm.ivec3,
@@ -82,19 +86,13 @@ class TransmittanceRenderer(RendererModule):
         pipeline.close()
         self.forward_pipeline = pipeline
 
-        self.medium_buffer_b = self.device.create_uniform_buffer(
-            scatteringAlbedo=glm.vec3,
-            density=float,
-            phase_g=float
-        )
-
         pipeline = self.device.create_compute_pipeline()
         pipeline.load_compute_shader(__VOLUME_RECONSTRUCTION_SHADERS__ + '/backward.comp.spv')
-        pipeline.bind_storage_buffer(0, ShaderStage.COMPUTE, lambda: self.get_input_gradient(1))
-        pipeline.bind_storage_buffer(1, ShaderStage.COMPUTE, lambda: self.get_input(0))
-        pipeline.bind_storage_buffer(2, ShaderStage.COMPUTE, lambda: self.get_output())
-        pipeline.bind_storage_buffer(3, ShaderStage.COMPUTE, lambda: self.get_output_gradient())
-        pipeline.bind_uniform(4, ShaderStage.COMPUTE, lambda: self.medium_buffer_b)
+        pipeline.bind_storage_buffer(0, ShaderStage.COMPUTE, lambda: self.backward_pipeline.grid_gradients)
+        pipeline.bind_storage_buffer(1, ShaderStage.COMPUTE, lambda: self.backward_pipeline.rays)
+        pipeline.bind_storage_buffer(2, ShaderStage.COMPUTE, lambda: self.backward_pipeline.transmittances)
+        pipeline.bind_storage_buffer(3, ShaderStage.COMPUTE, lambda: self.backward_pipeline.transmittance_gradients)
+        pipeline.bind_uniform(4, ShaderStage.COMPUTE, lambda: self.medium_buffer)
         pipeline.bind_constants(0, ShaderStage.COMPUTE,
                                 grid_dim=glm.ivec3,
                                 number_of_rays=int
@@ -106,18 +104,14 @@ class TransmittanceRenderer(RendererModule):
         self.medium_buffer.scatteringAlbedo = scattering_albedo
         self.medium_buffer.density = density
         self.medium_buffer.phase_g = phase_g
-        self.medium_buffer_b.scatteringAlbedo = scattering_albedo
-        self.medium_buffer_b.density = density
-        self.medium_buffer_b.phase_g = phase_g
 
-    def create_output_tensors(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+    def forward_render(self, inputs):
         rays, grid = inputs
+        grid_dim = grid.shape
         ray_count = torch.numel(rays) // 6
-        return [torch.zeros((ray_count, 3), device=rays.device)]
-
-    def forward_render(self, input_shapes, output_shapes):
-        _, grid_dim = input_shapes
-        ray_count = output_shapes[0][0]  # one output, get first dimension, i.e. (rays, components)[0]
+        self.forward_pipeline.rays = self.wrap_tensor(rays)
+        self.forward_pipeline.grid = self.wrap_tensor(grid)
+        self.forward_pipeline.transmittances = self.wrap_tensor(torch.zeros(ray_count, 3, device=rays.device), False)
         with self.device.get_compute() as man:
             man.set_pipeline(self.forward_pipeline)
             man.update_sets(0)
@@ -126,12 +120,19 @@ class TransmittanceRenderer(RendererModule):
                 number_of_rays=ray_count
             )
             man.dispatch_threads_1D(ray_count)
+        return [self.get_tensor(self.forward_pipeline.transmittances)]
 
-    def backward_render(self, input_shapes, output_shapes):
-        _, grid_dim = input_shapes
-        ray_count = output_shapes[0][0]  # one output, get first dimension, i.e. (rays, components)[0]
+    def backward_render(self, inputs, outputs, output_gradients):
+        rays, grid = inputs
+        transmittances, = outputs
+        transmittance_gradients, = output_gradients
+        grid_dim = grid.shape
+        ray_count = torch.numel(rays) // 6
+        self.backward_pipeline.rays = self.wrap_tensor(rays)
+        self.backward_pipeline.transmittances = self.wrap_tensor(transmittances)
+        self.backward_pipeline.transmittance_gradients = self.wrap_tensor(transmittance_gradients)
+        self.backward_pipeline.grid_gradients = self.wrap_tensor(torch.zeros_like(grid))
         with self.device.get_compute() as man:
-            man.clear_buffer(self.get_input_gradient(1)) # clear gradient to update in the compute shader
             man.set_pipeline(self.backward_pipeline)
             man.update_sets(0)
             man.update_constants(ShaderStage.COMPUTE,
@@ -139,12 +140,41 @@ class TransmittanceRenderer(RendererModule):
                                  number_of_rays=ray_count
                                  )
             man.dispatch_threads_1D(ray_count)
+        return [None, self.get_tensor(self.backward_pipeline.grid_gradients)]
 
 
+class ResampleGrid(RendererModule):
+    def __init__(self, device: DeviceManager, output_dim: (int, int, int), *args, **kwargs):
+        self.output_dim = output_dim
+        super().__init__(device, *args, **kwargs)
 
+    def setup(self):
+        pipeline = self.device.create_compute_pipeline()
+        pipeline.load_compute_shader(__VOLUME_RECONSTRUCTION_SHADERS__ + "/resampling.comp.spv")
+        pipeline.bind_storage_buffer(0, ShaderStage.COMPUTE, lambda: self.pipeline.dst_grid)
+        pipeline.bind_storage_buffer(1, ShaderStage.COMPUTE, lambda: self.pipeline.src_grid)
+        pipeline.bind_constants(0, ShaderStage.COMPUTE,
+                                dst_grid_dim=glm.ivec3, rem0=float,
+                                src_grid_dim=glm.ivec3, rem1=float
+                                )
+        pipeline.close()
+        self.pipeline = pipeline
 
-
-
+    def forward_render(self, inputs: List[torch.Tensor]):
+        src_grid, = inputs
+        self.pipeline.src_grid = self.wrap_tensor(src_grid)
+        self.pipeline.dst_grid = self.wrap_tensor(torch.zeros(self.output_dim, device=src_grid.device))
+        src_grid_dim = src_grid.shape
+        dst_grid_dim = self.output_dim
+        with self.device.get_compute() as man:
+            man.set_pipeline(self.pipeline)
+            man.update_sets(0)
+            man.update_constants(ShaderStage.COMPUTE,
+                dst_grid_dim=glm.ivec3(dst_grid_dim[2], dst_grid_dim[1], dst_grid_dim[0]),
+                src_grid_dim=glm.ivec3(src_grid_dim[2], src_grid_dim[1], src_grid_dim[0])
+            )
+            man.dispatch_threads_1D(dst_grid_dim[0] * dst_grid_dim[1] * dst_grid_dim[0])
+        return [self.get_tensor(self.pipeline.dst_grid)]
 
 
 
