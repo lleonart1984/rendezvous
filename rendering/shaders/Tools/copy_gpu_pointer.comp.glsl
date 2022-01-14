@@ -6,8 +6,8 @@
 
 layout (local_size_x = 1024, local_size_y = 1, local_size_z = 1) in;
 
-layout (buffer_reference, std430) buffer Block {
-    uint data[];
+layout (buffer_reference, std430, buffer_reference_align = 4) buffer Block {
+    uint data;
 };
 
 layout( push_constant ) uniform Constants {
@@ -28,9 +28,9 @@ void main()
 
     int end = min(size_in_uints, start + 128);
 
-    Block src = Block(consts.src_pointer);
-    Block dst = Block(consts.dst_pointer);
+    uint64_t src_pointer = consts.src_pointer;
+    uint64_t dst_pointer = consts.dst_pointer;
 
     for (int i = start; i < end; i++)
-        dst.data[i] = src.data[i];
+        Block(dst_pointer + uint64_t(i*4)).data = Block(src_pointer + uint64_t(i*4)).data;
 }

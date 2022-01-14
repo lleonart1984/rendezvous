@@ -11,6 +11,7 @@ import struct
 import torch
 import os
 import subprocess
+import threading
 
 
 def compile_shader_sources(directory='.', force_all: bool = False):
@@ -103,7 +104,7 @@ class Format(IntEnum):
     UVEC2 = VK_FORMAT_R32G32_UINT
     UVEC3 = VK_FORMAT_R32G32B32_UINT
     UVEC4 = VK_FORMAT_R32G32B32A32_UINT
-
+    PRESENTER = VK_FORMAT_B8G8R8A8_SRGB
 
 class ImageType(IntEnum):
     TEXTURE_1D = VK_IMAGE_TYPE_1D
@@ -383,6 +384,24 @@ class Uniform(Buffer):
         raise AttributeError(f"Can not set attribute {item}")
 
 
+class GPUWrapPtr(Uniform):
+    def __init__(self, device, w_buffer: vkw.ResourceWrapper):
+        super().__init__(device, w_buffer, {'ptr': (0, 8, glm.uint64)})
+
+    def wrap(self, obj, offset: int = 0):
+        if obj is None:
+            obj = 0
+            offset = 0
+        if isinstance(obj, torch.Tensor):
+            assert obj.is_cuda, "Only gpu tensors can be wrapped"
+            obj = obj.detach().flatten()
+            obj[0] = obj[0].item()  # STUPID, I KNOW
+            obj = obj.storage().data_ptr()
+        if isinstance(obj, Buffer):
+            obj = self.device.w_device.get_buffer_gpu_ptr(obj)
+        self.ptr = glm.uint64(obj + offset)
+
+
 class StructuredBuffer(Buffer):
     def __init__(self, device, w_buffer: vkw.ResourceWrapper, layout: Dict[str, Tuple[int, int, type]], stride: int):
         self.layout = layout
@@ -391,7 +410,7 @@ class StructuredBuffer(Buffer):
         self.stride = stride
 
     def __getitem__(self, item):
-        return Uniform(self.w_resource.slice_buffer(item * self.stride, self.stride), self.layout)
+        return Uniform(self.device, self.w_resource.slice_buffer(item * self.stride, self.stride), self.layout)
 
 
 class IndexBuffer(Buffer):
@@ -677,6 +696,12 @@ class Pipeline:
     def bind_uniform_array(self, slot: int, stage: ShaderStage, count: int, resolver):
         self._bind_resource(slot, stage, count, resolver, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
 
+    def bind_wrap_gpu(self, slot: int, stage: ShaderStage, resolver):
+        self._bind_resource(slot, stage, 1, lambda: [resolver()], VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
+
+    def bind_wrap_gpu_array(self, slot: int, stage: ShaderStage, count: int, resolver):
+        self._bind_resource(slot, stage, count, resolver, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
+
     def bind_storage_buffer(self, slot: int, stage: ShaderStage, resolver):
         self._bind_resource(slot, stage, 1, lambda: [resolver()], VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
 
@@ -762,12 +787,20 @@ class Pipeline:
 
 class CommandManager:
 
-    def __init__(self, w_cmdList: vkw.CommandBufferWrapper):
+    def __init__(self, device, w_cmdList: vkw.CommandBufferWrapper):
         self.w_cmdList = w_cmdList
+        self.device = device
+
+    def __del__(self):
+        self.w_cmdList = None
+        self.device = None
 
     @classmethod
     def get_queue_required(cls) -> int:
         pass
+
+    def freeze(self):
+        self.w_cmdList.freeze()
 
     def is_frozen(self):
         return self.w_cmdList.is_frozen()
@@ -779,12 +812,12 @@ class CommandManager:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.w_cmdList.flush_and_wait()
+        self.device.safe_dispatch_function(lambda: self.w_cmdList.flush_and_wait())
 
 
 class CopyManager(CommandManager):
-    def __init__(self, w_cmdList: vkw.CommandBufferWrapper):
-        super().__init__(w_cmdList)
+    def __init__(self, device, w_cmdList: vkw.CommandBufferWrapper):
+        super().__init__(device, w_cmdList)
 
     @classmethod
     def get_queue_required(cls) -> int:
@@ -801,10 +834,13 @@ class CopyManager(CommandManager):
     def copy_image(self, src_image: Image, dst_image: Image):
         self.w_cmdList.copy_image(src_image.w_resource, dst_image.w_resource)
 
+    def copy_buffer_to_image(self, src_buffer: Buffer, dst_image: Image):
+        self.w_cmdList.copy_buffer_to_image(src_buffer.w_resource, dst_image.w_resource)
+
 
 class ComputeManager(CopyManager):
-    def __init__(self, w_cmdList: vkw.CommandBufferWrapper):
-        super().__init__(w_cmdList)
+    def __init__(self, device, w_cmdList: vkw.CommandBufferWrapper):
+        super().__init__(device, w_cmdList)
 
     @classmethod
     def get_queue_required(cls) -> int:
@@ -848,17 +884,20 @@ class ComputeManager(CopyManager):
 
 
 class GraphicsManager(ComputeManager):
-    def __init__(self, w_cmdList: vkw.CommandBufferWrapper):
-        super().__init__(w_cmdList)
+    def __init__(self, device, w_cmdList: vkw.CommandBufferWrapper):
+        super().__init__(device, w_cmdList)
 
     @classmethod
     def get_queue_required(cls) -> int:
         return QueueType.GRAPHICS
 
+    def blit_image(self, src_image: Image, dst_image: Image, filter: Filter = Filter.POINT):
+        self.w_cmdList.blit_image(src_image.w_resource, dst_image.w_resource, filter)
+
 
 class RaytracingManager(GraphicsManager):
-    def __init__(self, w_cmdList: vkw.CommandBufferWrapper):
-        super().__init__(w_cmdList)
+    def __init__(self, device, w_cmdList: vkw.CommandBufferWrapper):
+        super().__init__(device, w_cmdList)
 
     @classmethod
     def get_queue_required(cls) -> int:
@@ -879,6 +918,37 @@ class DeviceManager:
         self.width = 0
         self.height = 0
         self.__copying_on_the_gpu = None
+        self.__queue = None
+        self.__loop_process = None
+
+    def safe_dispatch_function(self, function):
+        if threading.current_thread() == threading.main_thread():
+            function()
+            return
+        if self.__queue is None:
+            raise Exception("Can not dispatch cross-thread function without looping")
+        event = threading.Event()
+        self.__queue.append((function, event))
+        event.wait()
+
+
+    def loop(self, process):
+        assert threading.current_thread() == threading.main_thread(), "Loops can only be invoked from main thread!"
+        window: Window = self.w_device.get_window()
+        if self.__loop_process is not None:
+            self.__loop_process.join()  # wait for an unfinished loop first
+        self.__queue = []  # start dispatch queue
+        self.__loop_process = threading.Thread(target=process)
+        self.__loop_process.start()
+        while self.__loop_process.is_alive():
+            if window is not None:
+                ev, args = window.poll_events()
+                if ev == Event.CLOSED:
+                    return
+            while len(self.__queue) > 0:  # consume all pending dispatched functions
+                f, event = self.__queue.pop(0)
+                f()
+                event.set()
 
     def __del__(self):
         self.__copying_on_the_gpu = None
@@ -928,12 +998,17 @@ class DeviceManager:
                      width: int, height: int, depth: int,
                      mips: int, layers: int,
                      usage: int, memory: MemoryProperty):
-        linear = False  # bool(usage & (VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
+        # TODO: PROPERLY CHECK FOR OPTIMAL TILING SUPPORT
+        linear = image_format == Format.VEC3  # bool(usage & (VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
         layout = VK_IMAGE_LAYOUT_UNDEFINED
         return Image(self, self.w_device.create_image(
             image_type, image_format, VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT if is_cube else 0,
             VkExtent3D(width, height, depth), mips, layers, linear, layout, usage, memory
         ))
+
+    def create_gpu_wrapped_ptr(self):
+        resource = self.w_device.create_buffer(8, BufferUsage.UNIFORM, MemoryProperty.CPU_ACCESSIBLE)
+        return GPUWrapPtr(self, resource)
 
     def create_triangle_collection(self):
         return TriangleCollection(device=self.w_device)
@@ -955,7 +1030,7 @@ class DeviceManager:
                 instance_buffer.w_resource
             ]
         )
-        return ADS(ads, handle, scratch_size, info, ranges, instance_buffer)
+        return ADS(self, ads, handle, scratch_size, info, ranges, instance_buffer)
 
     def create_instance_buffer(self, instances: int, memory: MemoryProperty = MemoryProperty.GPU):
         buffer = self.w_device.create_buffer(instances*64,
@@ -1061,19 +1136,23 @@ class DeviceManager:
         return self.w_device.create_cmdList(queue_bits)
 
     def get_graphics(self) -> GraphicsManager:
-        return GraphicsManager(self._get_queue_manager(QueueType.GRAPHICS))
+        return GraphicsManager(self, self._get_queue_manager(QueueType.GRAPHICS))
 
     def get_compute(self) -> ComputeManager:
-        return ComputeManager(self._get_queue_manager(QueueType.COMPUTE))
+        return ComputeManager(self, self._get_queue_manager(QueueType.COMPUTE))
 
     def get_raytracing(self) -> RaytracingManager:
-        return RaytracingManager(self._get_queue_manager(QueueType.RAYTRACING))
+        return RaytracingManager(self, self._get_queue_manager(QueueType.RAYTRACING))
 
     def get_copy(self) -> CopyManager:
-        return CopyManager(self._get_queue_manager(QueueType.COPY))
+        return CopyManager(self, self._get_queue_manager(QueueType.COPY))
+
+    def submit(self, man: CommandManager):
+        assert man.is_frozen(), "Only frozen managers can be submitted"
+        self.safe_dispatch_function(lambda: man.w_cmdList.flush_and_wait())
 
     def flush(self):
-        return self.w_device.flush_pending_and_wait()
+        self.safe_dispatch_function(lambda: self.w_device.flush_pending_and_wait())
 
     def __enter__(self):
         return self
@@ -1117,10 +1196,10 @@ class Presenter(DeviceManager):
         super().__init__()
 
     def begin_frame(self):
-        self.w_device.begin_frame()
+        self.safe_dispatch_function(lambda: self.w_device.begin_frame())
 
     def end_frame(self):
-        self.w_device.end_frame()
+        self.safe_dispatch_function(lambda: self.w_device.end_frame())
 
     def screenshot(self):
         pass
@@ -1134,6 +1213,7 @@ class Presenter(DeviceManager):
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.end_frame()
+
 
 
 def create_presenter(width: int, height: int,

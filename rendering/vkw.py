@@ -13,6 +13,8 @@ import ctypes
 from enum import Enum
 import numpy as np
 import torch
+import threading
+
 
 __TRACE__ = False
 
@@ -1134,6 +1136,53 @@ class CommandBufferWrapper:
     def to_gpu(self, w_resource: ResourceWrapper):
         w_resource.add_transfer_to_gpu(self.vk_cmdList)
 
+    def blit_image(self, w_src: ResourceWrapper, w_dst: ResourceWrapper, filter: int):
+        w_src.add_barrier(self.vk_cmdList, ResourceState(
+            vk_access=VK_ACCESS_TRANSFER_READ_BIT,
+            vk_stage=VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            vk_layout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            queue_index=VK_QUEUE_FAMILY_IGNORED))
+        w_dst.add_barrier(self.vk_cmdList, ResourceState(
+            vk_access=VK_ACCESS_TRANSFER_WRITE_BIT,
+            vk_stage=VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            vk_layout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            queue_index=VK_QUEUE_FAMILY_IGNORED))
+
+        src_index = w_src.current_slice["array_start"] + w_src.current_slice["mip_start"] * w_src.resource_data.full_slice["array_count"]
+        src_footprint, _ = w_src.resource_data.get_staging_footprint_and_offset(src_index)
+        dst_index = w_dst.current_slice["array_start"] + w_dst.current_slice["mip_start"] * w_dst.resource_data.full_slice["array_count"]
+        dst_footprint, _ = w_dst.resource_data.get_staging_footprint_and_offset(dst_index)
+
+        src_w, src_h, src_d = src_footprint.dim
+        dst_w, dst_h, dst_d = dst_footprint.dim
+
+        src_regions = [VkOffset3D(0,0,0), VkOffset3D(src_w, src_h, src_d)]
+        dst_regions = [VkOffset3D(0,0,0), VkOffset3D(dst_w, dst_h, dst_d)]
+
+        vkCmdBlitImage(self.vk_cmdList, w_src.resource_data.vk_resource, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, w_dst.resource_data.vk_resource, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                       [
+                           VkImageBlit(
+                               ResourceWrapper.get_subresource_layers(w_src.current_slice),
+                               src_regions,
+                               ResourceWrapper.get_subresource_layers(w_dst.current_slice),
+                               dst_regions
+                           )
+                       ], filter)
+
+    def copy_buffer_to_image(self, w_src: ResourceWrapper, w_dst: ResourceWrapper):
+        w_dst.add_barrier(self.vk_cmdList, ResourceState(
+            vk_access=VK_ACCESS_TRANSFER_WRITE_BIT,
+            vk_stage=VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            vk_layout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            queue_index=VK_QUEUE_FAMILY_IGNORED))
+        subresource_index = w_dst.current_slice["array_start"] + w_dst.current_slice["mip_start"] * \
+                            w_dst.resource_data.full_slice["array_count"]
+        footprint, offset = w_dst.resource_data.get_staging_footprint_and_offset(subresource_index)
+        w, h, d = footprint.dim
+        vkCmdCopyBufferToImage(self.vk_cmdList, w_src.resource_data.vk_resource, w_dst.resource_data.vk_resource, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,[
+            VkBufferImageCopy(w_src.current_slice["offset"], 0, 0, ResourceWrapper.get_subresource_layers(w_dst.current_slice), VkOffset3D(0,0,0), VkExtent3D(w, h, d))
+        ])
+
     def copy_image(self, w_src: ResourceWrapper, w_dst: ResourceWrapper):
         w_src.add_barrier(self.vk_cmdList, ResourceState(
             vk_access=VK_ACCESS_TRANSFER_READ_BIT,
@@ -1401,7 +1450,6 @@ class DeviceWrapper:
         self.mode = mode
         self.enable_validation_layers = enable_validation_layers
         self.render_target_usage = render_usage
-
         self.vk_device = None
         self.__window = None
         self.__instance = None
@@ -1493,6 +1541,7 @@ class DeviceWrapper:
         self.vkGetPhysicalDeviceProperties2=vkGetInstanceProcAddr(self.__instance, "vkGetPhysicalDeviceProperties2KHR")
         ResourceData.vkDestroyAccelerationStructure = vkGetInstanceProcAddr(self.__instance,
                                                                                  "vkDestroyAccelerationStructureKHR")
+        # self.vkGetPhysicalDeviceFormatProperties = vkGetInstanceProcAddr(self.__instance, "vkGetPhysicalDeviceFormatProperties")
 
     def __createSwapchain(self):
         self.__render_target_extent = VkExtent2D(self.width, self.height)
@@ -1630,7 +1679,6 @@ class DeviceWrapper:
             pNext = ads_features,
             rayTracingPipeline=True,
         )
-
 
         features = VkPhysicalDeviceVulkan12Features(
             pNext=rt_features,
@@ -1845,6 +1893,11 @@ class DeviceWrapper:
         vk12_prop = VkPhysicalDeviceVulkan12Properties(pNext=rt_prop)
         prop = VkPhysicalDeviceProperties2(pNext=vk12_prop)
         self.vkGetPhysicalDeviceProperties2(self.__physical_device, prop)
+
+        formats = [VK_FORMAT_R32G32B32_SFLOAT]
+        for f in formats:
+            format_prop = vkGetPhysicalDeviceFormatProperties(self.__physical_device, f)
+
         self.raytracing_properties = rt_prop
         major, minor = VK_VERSION_MAJOR(prop.properties.apiVersion), VK_VERSION_MINOR(prop.properties.apiVersion)
         print("[INFO] Available devices: %s" % [p.deviceName
@@ -1911,6 +1964,7 @@ class DeviceWrapper:
             pWaitDstStageMask=[VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT],
             signalSemaphoreCount=1,
             pSignalSemaphores=[self.__render_target_rendered[self.__frame_index]])
+
         vkQueueSubmit(self.__main_manager.vk_queue, 1, [submit_create], None)
         # Present render target
         present_create = VkPresentInfoKHR(

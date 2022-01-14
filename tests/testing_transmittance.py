@@ -3,8 +3,7 @@ import time
 import numpy as np
 import matplotlib.pyplot as plt
 from rendering.tools import *
-from rendering.training import *
-from techniques.volumerec import *
+from rendering.modules import *
 import torch
 
 
@@ -21,44 +20,52 @@ used_device = torch.device('cuda:0')
 
 # load grid
 grid = torch.Tensor(tools.load_file_as_numpy('C:/Users/mendez/Desktop/clouds/disney_big.xyz')).to(used_device)
+grid_dim = grid.shape
+
+box_maxim = vec3(grid_dim[2], grid_dim[1], grid_dim[0]) * 0.5 / max(grid_dim[0], max(grid_dim[1], grid_dim[2]))
+box_minim = -1*box_maxim
+box_size = box_maxim - box_minim
 
 print("[INFO] Loaded grid")
 
 image_width = 512
 image_height = 512
 
-medium_parameters = { 'scattering_albedo': vec3(1,1,1), 'density': 10, 'phase_g': 0.875 }
+medium_parameters = { 'scattering_albedo': vec3(1, 1, 1), 'density': 10, 'phase_g': 0.875 }
 
 def view_grid(grid, look_position, look_target):
     ray_generator = RayGenerator(presenter, (image_height, int(image_width*1.4)), 0)
     rays = ray_generator(torch.Tensor([*look_position]), torch.Tensor([*look_target]))
     transmittance_module = TransmittanceRenderer(presenter)
     transmittance_module.set_medium(**medium_parameters)
+    transmittance_module.set_box(box_minim, box_size)
     transmittances = transmittance_module(rays, grid)
     plt.imshow(transmittances.detach().reshape(image_height, int(image_width*1.4), 3).cpu().numpy())
     plt.show()
 
-
 view_grid(grid, (0.8, 0.1, 0.5), (0,0,0))
 
+
 cameras = [
-    glm.rotate(i*360/7, vec3(0,1,0))*vec3(1, 0, 0) for i in range(7)
+    glm.rotate(i*360/11, vec3(0,1,0))*vec3(1, 0, 0) for i in range(11)
 ] + [glm.vec3(0.1, 1, 0.2), glm.vec3(-0.2,-1, 0.1)]
 
 origins = torch.Tensor(np.array([[c.x, c.y, c.z] for c in cameras], dtype=np.float32)).to(used_device)
 targets = torch.zeros_like(origins)
 
-ray_generator = RayGenerator(presenter, (image_height, image_width), 0).to(used_device)
+ray_generator = RayGenerator(presenter, (image_height, image_width), 0)
 
 full_rays = ray_generator(origins, targets)
 
 transmittance_module = TransmittanceRenderer(presenter)
 transmittance_module.set_medium(**medium_parameters)
+transmittance_module.set_box(box_minim, box_size)
 
 transmittances = transmittance_module(full_rays, grid)
 
-plt.imshow(transmittances.reshape((len(cameras), image_height, image_width, 3)).cpu().numpy()[0])
-plt.show()
+# for i in range(len(cameras)):
+#     plt.imshow(transmittances.reshape((len(cameras), image_height, image_width, 3)).cpu().numpy()[i])
+#     plt.show()
 
 class TrainableCloud(nn.Module):
     def __init__(self, device, grid_or_dim):
@@ -68,9 +75,6 @@ class TrainableCloud(nn.Module):
         else:
             self.Grid = nn.Parameter(torch.zeros(*grid_or_dim))
         self.transmittance_renderer = TransmittanceRenderer(device)
-
-    def set_medium(self, scattering_albedo: glm.vec3, density: float, phase_g: float):
-        self.transmittance_renderer.set_medium(scattering_albedo, density, phase_g)
 
     def forward(self, *args):
         rays, = args
@@ -86,25 +90,31 @@ while rec_size[0] >= 32 and rec_size[1] >= 32 and rec_size[2] >= 32:
     rec_size[2] //= 2
 list.reverse(rec_sizes)
 
+print("[INFO] Optimization starts...")
 
 _time = time.perf_counter()
 
 rec_grid = None
 
-lr = 0.1
+lr = 0.2
+
+num_epochs = 30
 
 for rec_grid_size in rec_sizes:
     if rec_grid is None:  # first grid
         rec_grid = torch.zeros(*rec_sizes[0], device=used_device)
     else:  # get from upsampling
-        upscaling = ResampleGrid(presenter, rec_grid_size)
-        rec_grid = upscaling(rec_grid)
+        upscaling = Resample3D(presenter, rec_grid_size)
+        rec_grid = torch.clamp(upscaling(rec_grid), 0.0, 1.0)
+        view_grid(rec_grid, (0.8, 0.1, 0.5), (0,0,0))
 
     model = TrainableCloud(presenter, rec_grid)
-    model.set_medium(**medium_parameters)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, 0.99)
-    num_epochs = 20
+    model.transmittance_renderer.set_medium(**medium_parameters)
+    model.transmittance_renderer.set_box(box_minim, box_size)
+
+    # num_epochs //= 2
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, amsgrad=True)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, 0.999)
     for epoch in range(0, num_epochs):
         optimizer.zero_grad()
         output = model(full_rays)

@@ -5,7 +5,7 @@ print(torch.cuda.is_available())
 
 
 t = torch.zeros(3, device=torch.device('cuda:0'))
-t[0] = t[0].item()
+# t[0] = t[0].item()
 
 t2 = torch.ones(3, device=torch.device('cuda:0'))
 t2[0] = t2[0].item()

@@ -6,11 +6,7 @@ from rendering.manager import *
 class RendererModule(nn.Module):
     r"""
     Module that performs gradient-based operations on graphics or raytracing pipelines.
-    :ivar device: Device manager used to render
-    :ivar input_sizes: list of int indicating the input tensor sizes.
-    :ivar input_trainable: list of bool indicating if each input is backprop. If None all input is considered trainable
-    :ivar parameter_sizes: list of int indicating the sizes of all internal trainable parameter tensor sizes.
-    :ivar output_sizes: list of int indicating the sizes of all output tensor sizes.
+    :ivar device: Device manager used to render and create resources
     """
     def __init__(self,
                  device: DeviceManager,
@@ -19,13 +15,25 @@ class RendererModule(nn.Module):
         """
         super().__init__()
         self.device = device
-        self._cached_buffers = { }
-        self._wrapped_tensors = { }
+        if device not in RendererModule.__CACHED_BUFFERS:
+            RendererModule.__CACHED_BUFFERS[device] = {}
+        self._cached_buffers = RendererModule.__CACHED_BUFFERS[device]
+        self._used_buffers = { }
         self.setup()
 
-    def wrap_tensor(self, tensor: torch.Tensor, copy_data: bool = True) -> Buffer:
-        buffer: Buffer = self._resolve_buffer(torch.numel(tensor)*4)
-        self._wrapped_tensors[buffer] = tensor
+    __CACHED_BUFFERS = { }
+
+    @staticmethod
+    def clear_cache():
+        RendererModule.__CACHED_BUFFERS = { }
+
+    def tensor_to_buffer(self, tensor: torch.Tensor, copy_data: bool = True, buffer: Buffer = None) -> Buffer:
+        if tensor is None:
+            return None
+        assert buffer is None or buffer.size == torch.numel(tensor)*4, "Reused buffer has not the required size"
+        if buffer is None:
+            buffer: Buffer = self._resolve_buffer(torch.numel(tensor)*4)
+        self._used_buffers[buffer] = tensor.shape  # save shape for recover later
         if copy_data:
             if tensor.is_cuda:
                 buffer.write_gpu_tensor(tensor)
@@ -33,14 +41,16 @@ class RendererModule(nn.Module):
                 buffer.write_direct(tensor)
         return buffer
 
-    def get_tensor(self, buffer: Buffer) -> torch.Tensor:
-        assert buffer in self._wrapped_tensors, "Tensor should be wrapped first"
-        tensor = self._wrapped_tensors[buffer]
-        if tensor.is_cuda:
-            buffer.read_gpu_tensor(tensor)
-        else:
-            buffer.read_direct(tensor)
-        return tensor
+    def create_buffer(self, shape) -> Buffer:
+        num_elements = math.prod(shape)
+        buffer = self._resolve_buffer(num_elements * 4)
+        self._used_buffers[buffer] = shape
+        return buffer
+
+    def buffer_to_tensor(self, buffer: Buffer) -> torch.Tensor:
+        assert buffer in self._used_buffers, "Tensor should be turned to a buffer first"
+        self._cached_buffers[buffer.size].append(buffer)  # for future reuse
+        return buffer.as_gpu_tensor().clone().reshape(self._used_buffers.pop(buffer))
 
     def _resolve_buffer(self, required_size) -> Buffer:
         if required_size == 0:
@@ -57,12 +67,9 @@ class RendererModule(nn.Module):
         return self._cached_buffers[required_size].pop()
 
     def _free_buffers(self):
-        for b in self._wrapped_tensors:
+        for b in self._used_buffers:
             self._cached_buffers[b.size].append(b)
-        self._wrapped_tensors = {}
-
-    def clear_cache(self):
-        self._cached_buffers = { }
+        self._used_buffers = {}
 
     def setup(self):
         """
@@ -119,7 +126,7 @@ class TrainableRendererFunction(torch.autograd.Function):
         ctx.renderer = renderer
         ctx.number_of_inputs = len(inputs)
         outputs = renderer.forward_render(inputs)
-        ctx.save_for_backward(*(args[0:-1] + [o.detach().clone() for o in outputs]))
+        ctx.save_for_backward(*(args[0:-1] + [o.detach() for o in outputs]))
         renderer._free_buffers()
         return tuple(outputs)
 
