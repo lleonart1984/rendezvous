@@ -401,6 +401,18 @@ class GPUWrapPtr(Uniform):
             obj = self.device.w_device.get_buffer_gpu_ptr(obj)
         self.ptr = glm.uint64(obj + offset)
 
+    def wrap_input(self, obj, offset: int = 0):
+        if obj is None:
+            obj = 0
+            offset = 0
+        if isinstance(obj, torch.Tensor):
+            assert obj.is_cuda, "Only gpu tensors can be wrapped"
+            obj = obj.detach().flatten()
+            obj = obj.storage().data_ptr()
+        if isinstance(obj, Buffer):
+            obj = self.device.w_device.get_buffer_gpu_ptr(obj)
+        self.ptr = glm.uint64(obj + offset)
+
 
 class StructuredBuffer(Buffer):
     def __init__(self, device, w_buffer: vkw.ResourceWrapper, layout: Dict[str, Tuple[int, int, type]], stride: int):
@@ -920,9 +932,14 @@ class DeviceManager:
         self.__copying_on_the_gpu = None
         self.__queue = None
         self.__loop_process = None
+        self.__allow_cross_thread_without_looping = False
+
+    def allow_cross_threading(self):
+        self.__allow_cross_thread_without_looping = True
+        print("[WARNING] Allow access from other threads is dangerous. Think in wrapping the concurrent process in a loop")
 
     def safe_dispatch_function(self, function):
-        if threading.current_thread() == threading.main_thread():
+        if threading.current_thread() == threading.main_thread() or self.__allow_cross_thread_without_looping:
             function()
             return
         if self.__queue is None:
@@ -930,7 +947,6 @@ class DeviceManager:
         event = threading.Event()
         self.__queue.append((function, event))
         event.wait()
-
 
     def loop(self, process):
         assert threading.current_thread() == threading.main_thread(), "Loops can only be invoked from main thread!"
@@ -949,6 +965,7 @@ class DeviceManager:
                 f, event = self.__queue.pop(0)
                 f()
                 event.set()
+        self.__queue = None
 
     def __del__(self):
         self.__copying_on_the_gpu = None

@@ -150,6 +150,31 @@ vec3 DT_Radiance(inout uvec4 seed, vec3 x, vec3 w, float total_d, vec3 sel){
 }
 
 
+float PRB_Transmittance(inout uvec4 seed, vec3 x, vec3 w, float total_d){
+    float T = 1.0;
+    float pdf_T = 1;
+    while (true) {
+        t = -log(1 - random(seed)) / g_density;
+        if (t >= total_d - 0.000001)
+        break; // emitter reached
+
+        xe += we * t;
+        T *= 1 - sample_volume(seed, xe);
+
+        if (T < 0.001){
+            if (random(seed) >= 0.001)
+            {
+                T = 0;
+                break;
+            };
+            pdf_T *= 0.001;
+        }
+        total_d -= t;
+    }
+
+    return T / pdf_T;
+}
+
 vec3 PRB_Radiance(inout uvec4 seed, vec3 x, vec3 w, float total_d, vec3 sel)
 {
     float scatteringAlbedo = dot(sel, g_scatteringAlbedo);

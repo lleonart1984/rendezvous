@@ -100,27 +100,29 @@ void backprop_PRB_Radiance(inout uvec4 seed, vec3 x, vec3 w, float total_d, vec3
         x += t * w;
 
         uvec4 sample_volume_copy_seed = seed;
+
         float voxel_density = sample_volume(seed, x);
 
         if (random(seed) < 1 - voxel_density)// null collision
         {
+            uvec4 s = sample_volume_copy_seed;
             float Pn = 1 - voxel_density;
             vec3 dL_dPn = vec3(1, 1, 1);// L = Pn(x)*L(w_n) + Ps(x)*L_s(x)
             float dPn_ddensity = -1;
-            float de_ddensity = dot (L / Pn * de_dL, dL_dPn) * dPn_ddensity;
-            backprop_sample_volume(sample_volume_copy_seed, x, de_ddensity);
+            float de_ddensity = -dot(de_dL * sel * L / max(0.000001, Pn), vec3(1,1,1));//dot (L / max(0.000001, Pn) * de_dL, dL_dPn) * dPn_ddensity;
+            backprop_sample_volume(s, x, de_ddensity);
             total_d -= t;
             continue;
         }
 
         // Backprop event Ps + Pa
         {
-            sample_volume_copy_seed = seed;
+            uvec4 s = sample_volume_copy_seed;
             float Pt = voxel_density;
             vec3 dL_dPt = vec3(1, 1, 1);
             float dPt_ddensity = 1;
-            float de_ddensity = dot(L / Pt * de_dL, dL_dPt) * dPt_ddensity;
-            backprop_sample_volume(sample_volume_copy_seed, x, de_ddensity);
+            float de_ddensity = dot(de_dL * sel * L / max(0.000001, Pt), vec3(1,1,1));//dot(L / max(0.000001, Pt) * de_dL, dL_dPt) * dPt_ddensity;
+            backprop_sample_volume(s, x, de_ddensity);
         }
 
         if (random(seed) < 1 - scatteringAlbedo) // absorption
@@ -153,24 +155,24 @@ void backprop_PRB_Radiance(inout uvec4 seed, vec3 x, vec3 w, float total_d, vec3
             de -= t;
         }
 
-        xe = x;
-        float Ts = 1;
-        de = tMax - tMin;
-        while (true) {
-            t = -log(1 - random(transmittance_copy_seed)) / g_density;
-            if (t >= de - 0.000001)
-            break; // emitter reached
-            xe += we * t;
-            uvec4 sample_volume_copy_seed = transmittance_copy_seed;
-            float r = 1 - sample_volume(transmittance_copy_seed, xe);
-            backprop_sample_volume(sample_volume_copy_seed, xe, dot(de_dL*(-1)*T/r, vec3(1,1,1)));
-            Ts *= r;
-            if (Ts < 0.001){
-                if (random(transmittance_copy_seed) >= 0.001)
-                    break;
-            }
-            de -= t;
-        }
+//        xe = x;
+//        float Ts = 1;
+//        de = tMax - tMin;
+//        while (true) {
+//            t = -log(1 - random(transmittance_copy_seed)) / g_density;
+//            if (t >= de - 0.000001)
+//            break; // emitter reached
+//            xe += we * t;
+//            uvec4 sample_volume_copy_seed = transmittance_copy_seed;
+//            float r = 1 - sample_volume(transmittance_copy_seed, xe);
+//            Ts *= r;
+//            if (Ts < 0.001){
+//                if (random(transmittance_copy_seed) >= 0.001)
+//                    break;
+//            }
+//            backprop_sample_volume(sample_volume_copy_seed, xe, -dot(de_dL * sel * Le * T / pdf_T / max(0.0000001,r), vec3(1,1,1)));// dot(de_dL*(1)/max(0.000001, r), vec3(1,1,1)));
+//            de -= t;
+//        }
 
         L -= T * Le / pdf_T;
 

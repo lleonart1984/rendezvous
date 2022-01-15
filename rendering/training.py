@@ -125,8 +125,11 @@ class TrainableRendererFunction(torch.autograd.Function):
         inputs = args[0:-1]
         ctx.renderer = renderer
         ctx.number_of_inputs = len(inputs)
+        clone_inputs = [t.clone() for t in inputs]
         outputs = renderer.forward_render(inputs)
-        ctx.save_for_backward(*(args[0:-1] + [o.detach() for o in outputs]))
+        clone_outputs = [t.clone() for t in outputs]
+        ctx.save_for_backward(*(clone_inputs + clone_outputs))
+        # ctx.save_for_backward(*(args[0:-1] + [o.detach().clone() for o in outputs]))
         renderer._free_buffers()
         return tuple(outputs)
 

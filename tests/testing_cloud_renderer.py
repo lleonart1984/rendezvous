@@ -21,7 +21,7 @@ if not os.path.exists('cache/cached_grid.pt'):
     grid = torch.Tensor(tools.load_file_as_numpy('C:/Users/mendez/Desktop/clouds/disney_big.xyz')).to(used_device)
     torch.save(grid, 'cache/cached_grid.pt')
 else:
-    grid = torch.load('cache/cached_grid.pt')
+    grid = torch.load('cache/cached_grid.pt').to(used_device)
 grid_dim = grid.shape
 
 box_maxim = vec3(grid_dim[2], grid_dim[1], grid_dim[0]) * 0.5 / max(grid_dim[0], max(grid_dim[1], grid_dim[2]))
@@ -58,4 +58,4 @@ def view_grid(grid, look_position, look_target, number_of_samples):
     plt.savefig('result.pdf', dpi=600)
     plt.show()
 
-view_grid(grid, (1.2, -0.2, 0.0), (0,0,0), 1)
+view_grid(grid, (1.2, -0.2, 0.0), (0,0,0), 20)

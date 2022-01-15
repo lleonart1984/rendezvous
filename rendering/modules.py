@@ -626,6 +626,7 @@ class VolumeRenderer(RendererModule):
                                 box_size=glm.vec3, pad1=float,
                                 )
         pipeline.close()
+        self.backward_pipeline = pipeline
 
 
     def set_medium(self, scattering_albedo: glm.vec3, density: float, phase_g: float):
@@ -645,8 +646,8 @@ class VolumeRenderer(RendererModule):
         grid_dim = grid.shape
         ray_count = torch.numel(rays) // 6
         radiances = torch.zeros(ray_count * 3, device=cuda_device)
-        self.rays.wrap(rays)
-        self.grid.wrap(grid)
+        self.rays.wrap_input(rays)
+        self.grid.wrap_input(grid)
         self.radiances.wrap(radiances)
 
         for _ in range(self.forward_samples):
@@ -668,17 +669,20 @@ class VolumeRenderer(RendererModule):
 
     def backward_render(self, input: List[torch.Tensor], output: List[torch.Tensor], output_gradients: List[torch.Tensor]) -> List[torch.Tensor]:
         rays, grid = input
-        output_device = rays.device
         cuda_device = torch.device('cuda:0')
         rays, grid = rays.to(cuda_device), grid.to(cuda_device)
         grid_dim = grid.shape
         ray_count = torch.numel(rays) // 6
-        radiances = torch.zeros(ray_count * 3, device=cuda_device)
-        self.rays.wrap(rays)
-        self.grid.wrap(grid)
-        self.radiances.wrap(radiances)
-
-        for _ in range(self.forward_samples):
+        grad_radiances, = output_gradients
+        output_device = grid.device
+        grad_grid = torch.zeros_like(grid, device=cuda_device)
+        self.rays.wrap_input(rays)
+        self.grid.wrap_input(grid)
+        self.grad_radiances.wrap_input(grad_radiances)
+        self.grad_grid.wrap(grad_grid)
+        for _ in range(self.backward_samples):
+            radiances = torch.zeros(ray_count * 3, device=cuda_device)
+            self.radiances.wrap(radiances)
             seeds = torch.randint(0, 1000000000, size=(ray_count, 4), device=cuda_device)
             self.seeds.wrap(seeds)
             with self.device.get_compute() as man:
@@ -691,6 +695,14 @@ class VolumeRenderer(RendererModule):
                                      box_size=self.box_size
                                      )
                 man.dispatch_threads_1D(ray_count)
-        shape = list(rays.shape)
-        shape[-1] //= 2  # for each 6 values in the last dimension there is 3 values in transmittances
-        return [(radiances / self.forward_samples).reshape(shape).to(output_device)]
+            with self.device.get_compute() as man:
+                man.set_pipeline(self.backward_pipeline)
+                man.update_sets(0)
+                man.update_constants(ShaderStage.COMPUTE,
+                                     grid_dim=glm.ivec3(grid_dim[2], grid_dim[1], grid_dim[0]),
+                                     number_of_rays=ray_count,
+                                     box_minim=self.box_minim,
+                                     box_size=self.box_size
+                                     )
+                man.dispatch_threads_1D(ray_count)
+        return [None, (grad_grid).to(output_device)]
